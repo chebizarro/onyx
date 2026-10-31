@@ -4,7 +4,7 @@
 // notifyChange(). FileSystemObserver-based external watching is not yet
 // implemented — Chromium-only and not required for Phase 2.
 
-type ChangeListener = () => void;
+type ChangeListener = (paths?: string[]) => void;
 type ModifyListener = (paths: string[]) => void;
 
 const changeListeners = new Set<ChangeListener>();
@@ -24,7 +24,7 @@ export function notifyChange(paths: string[]): void {
   if (!watchedVault) return;
   for (const cb of changeListeners) {
     try {
-      cb();
+      cb(paths);
     } catch (err) {
       console.error('[watcher] onFilesChanged listener threw:', err);
     }

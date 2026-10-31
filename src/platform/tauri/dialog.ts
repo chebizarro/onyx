@@ -1,4 +1,5 @@
-import { open } from '@tauri-apps/plugin-dialog';
+import { invoke } from '@tauri-apps/api/core';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import { readTextFile, writeTextFile, mkdir, exists } from '@tauri-apps/plugin-fs';
 import type { Dialog } from '../types';
 
@@ -8,6 +9,12 @@ export const dialog: Dialog = {
       | string
       | string[]
       | null;
+  },
+  async save(options = {}) {
+    const { excludedDirectory, ...pickerOptions } = options;
+    const path = await save(pickerOptions);
+    if (!path || !excludedDirectory) return path;
+    return invoke<string>('resolve_recovery_destination', { path, notebookPath: excludedDirectory });
   },
   readTextFile(path) {
     return readTextFile(path);

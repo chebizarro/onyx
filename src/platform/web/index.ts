@@ -31,6 +31,8 @@ export const platform: PlatformAdapter = {
   },
   refreshInfo,
   vault,
+  // OPFS has no links: the engine surface is the same object.
+  managedVault: vault,
   assets,
   secrets,
   settings,

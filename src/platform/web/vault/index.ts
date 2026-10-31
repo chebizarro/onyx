@@ -79,6 +79,11 @@ export const vault: VaultFS = {
     return tree;
   },
 
+  async listAll(root) {
+    const directory = await getVaultRoot(root);
+    return walkDirectory(directory, root);
+  },
+
   async listAssets(vaultPath) {
     const root = await getVaultRoot(vaultPath);
     const out: AssetEntry[] = [];

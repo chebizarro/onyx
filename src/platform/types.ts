@@ -36,6 +36,8 @@ export interface FileEntry {
   name: string;
   path: string;
   isDirectory: boolean;
+  /** Backends that expose links must mark them and never traverse them. */
+  isSymlink?: boolean;
   children?: FileEntry[];
 }
 
@@ -54,6 +56,10 @@ export interface FileStats {
 
 export interface VaultFS {
   list(vaultPath: string): Promise<FileEntry[]>;
+  /** Complete subtree, including dotfiles and every file extension. Never follow
+   * symlinks: omit them (Tauri), or mark isSymlink without listing children.
+   * OPFS has no symlinks. New backends must preserve this confinement contract. */
+  listAll(root: string): Promise<FileEntry[]>;
   listAssets(vaultPath: string): Promise<AssetEntry[]>;
   read(path: string, vaultPath: string): Promise<string>;
   readBinary(path: string, vaultPath: string): Promise<Uint8Array>;
@@ -67,10 +73,14 @@ export interface VaultFS {
   exists(path: string): Promise<boolean>;
   modifiedTime(path: string): Promise<number>;
   stats(path: string): Promise<FileStats>;
+  /** Filesystem identity of a notebook path: its canonical form, or for a path
+   * that does not exist yet, the canonical form of its nearest existing ancestor
+   * plus the remainder. Backends without aliases (OPFS) omit it. */
+  realPath?(path: string): Promise<string | null>;
   setVaultScope(vaultPath: string): Promise<void>;
   startWatching(vaultPath: string): Promise<void>;
   stopWatching(): Promise<void>;
-  onFilesChanged(cb: () => void): Promise<() => void>;
+  onFilesChanged(cb: (paths?: string[]) => void): Promise<() => void>;
   onFileModified(cb: (paths: string[]) => void): Promise<() => void>;
 }
 
@@ -132,6 +142,10 @@ export interface DialogOpenOptions {
 
 export interface Dialog {
   open(options?: DialogOpenOptions): Promise<string | string[] | null>;
+  /** Release an unused save-picker handle, when the platform retains one. */
+  discardSave?(path: string): void;
+  /** Select an external destination; cancellation returns null. Does not write. */
+  save(options?: Pick<DialogOpenOptions, 'defaultPath' | 'title' | 'filters'> & { excludedDirectory?: string }): Promise<string | null>;
   // Reads the text contents of a user-picked file from outside the vault.
   // On web, this is implemented via a File object captured during pick.
   readTextFile(path: string): Promise<string>;
@@ -316,7 +330,15 @@ export interface AppLifecycle {
 export interface PlatformAdapter {
   info: PlatformInfo;
   refreshInfo(): Promise<PlatformInfo>;
+  /** The legacy editor's filesystem: follows symbolic links the user created
+   * inside the notebook (a linked folder is the owner's grant). */
   vault: VaultFS;
+  /** The shared-vault engine's filesystem: identical listing/metadata surface,
+   * but reads, writes, folder creation and removal never follow a link below
+   * the notebook root and installs are temp-then-rename with an fsync policy
+   * (SV-32/SV-39). Remote writers choose the names written here, so a link the
+   * user planted must not redirect them. Backends without links reuse `vault`. */
+  managedVault: VaultFS;
   assets: Assets;
   secrets: SecretStore;
   settings: Settings;

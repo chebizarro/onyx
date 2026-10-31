@@ -1,6 +1,6 @@
 import type { PlatformAdapter, PlatformInfo } from '../types';
 import { cachedPlatformInfo, defaultPlatformInfo, fetchPlatformInfo } from './info';
-import { vault } from './vault';
+import { managedVault, vault } from './vault';
 import { assets } from './assets';
 import { secrets } from './secrets';
 import { settings } from './settings';
@@ -31,6 +31,7 @@ export const platform: PlatformAdapter = {
   },
   refreshInfo,
   vault,
+  managedVault,
   assets,
   secrets,
   settings,

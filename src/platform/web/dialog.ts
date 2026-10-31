@@ -7,6 +7,7 @@ import type { Dialog, DialogOpenOptions } from '../types';
 interface PickedEntry {
   file?: File;
   dirHandle?: FileSystemDirectoryHandle;
+  saveHandle?: { createWritable(): Promise<{ write(content: string): Promise<void>; close(): Promise<void>; abort(): Promise<void> }> };
 }
 
 const pickedRegistry = new Map<string, PickedEntry>();
@@ -75,6 +76,24 @@ export const dialog: Dialog = {
     if (options.directory) return pickDirectory();
     return pickFiles(options);
   },
+  discardSave(path) {
+    if (pickedRegistry.get(path)?.saveHandle) pickedRegistry.delete(path);
+  },
+  async save(options = {}) {
+    const picker = (window as unknown as {
+      showSaveFilePicker?: (options: { suggestedName?: string }) => Promise<NonNullable<PickedEntry['saveHandle']>>;
+    }).showSaveFilePicker;
+    if (!picker) throw new Error('This browser has no save picker. Export recovery from a supported browser or desktop app.');
+    try {
+      const handle = await picker.call(window, { suggestedName: options.defaultPath });
+      const path = virtualPath(options.defaultPath ?? 'recovery.json');
+      pickedRegistry.set(path, { saveHandle: handle });
+      return path;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return null;
+      throw error;
+    }
+  },
   async readTextFile(path) {
     const entry = pickedRegistry.get(path);
     if (!entry?.file) {
@@ -82,8 +101,14 @@ export const dialog: Dialog = {
     }
     return entry.file.text();
   },
-  async writeTextFile(_path, _content) {
-    throw new Error('Writing to arbitrary paths is not supported on web');
+  async writeTextFile(path, content) {
+    const handle = pickedRegistry.get(path)?.saveHandle;
+    if (!handle) throw new Error('Writing to arbitrary paths is not supported on web');
+    try {
+      const writable = await handle.createWritable();
+      try { await writable.write(content); await writable.close(); }
+      catch (error) { await writable.abort().catch(() => {}); throw error; }
+    } finally { pickedRegistry.delete(path); }
   },
   async mkdir(_path) {
     throw new Error('mkdir on arbitrary paths is not supported on web');
