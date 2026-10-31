@@ -195,6 +195,20 @@ fn validate_vault_path(path: &str, vault_path: &str) -> Result<PathBuf, String> 
     // this is a prefix test on the vault, never on the requested path.
     let mut allowed_roots = vec![normalized_vault.clone()];
     if let Ok(canonical_vault) = vault.canonicalize() {
+        // A root link's target may retain an ancestor alias (on macOS, /var
+        // rather than /private/var). It is another spelling of this root, not
+        // permission to canonicalize arbitrary requested descendants.
+        if let Ok(target) = fs::read_link(&normalized_vault) {
+            let target = if target.is_absolute() {
+                target
+            } else {
+                normalized_vault.parent().unwrap_or(Path::new("/")).join(target)
+            };
+            let target = lexically_normalize(&target)?;
+            if target.canonicalize().ok().as_ref() == Some(&canonical_vault) {
+                allowed_roots.push(target);
+            }
+        }
         if canonical_vault != normalized_vault {
             allowed_roots.push(canonical_vault);
         }
@@ -3494,6 +3508,24 @@ mod vault_path_tests {
             "the canonical spelling must be accepted too — walkdir and the watcher \
              can hand back either one"
         );
+        assert!(validate_vault_path(&canonical_spelled.to_string_lossy(), &format!("{}/", vault)).is_ok());
+        let fully_canonical = canonical_spelled.canonicalize().unwrap();
+        assert!(validate_vault_path(&fully_canonical.to_string_lossy(), &vault).is_ok());
+        assert!(validate_vault_path(&root.join("real/onyx/README.md").to_string_lossy(), &vault).is_err());
+        assert!(validate_vault_path(&link_vault.join("../real/onyx/README.md").to_string_lossy(), &vault).is_err());
+        assert!(validate_vault_path(&root.join("vault-sibling/file.md").to_string_lossy(), &vault).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_relative_symlinked_vault_root_accepts_its_target_spelling() {
+        let root = fixture("linked-vault-relative");
+        let link = root.join("vault-link");
+        symlink("vault", &link).unwrap();
+        let vault = link.to_string_lossy().to_string();
+        let target = root.join("vault/Notes/plain.md");
+        assert_eq!(validate_vault_path(&target.to_string_lossy(), &vault).unwrap(), target);
+        assert!(validate_vault_path(&root.join("real/onyx/README.md").to_string_lossy(), &vault).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 
