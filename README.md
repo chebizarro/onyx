@@ -40,6 +40,7 @@ Onyx lets you write markdown notes locally and sync them securely across devices
 - **Notifications Panel** - See documents shared with you, with sender profiles and timestamps
 - **Import Shared Docs** - Import received documents directly into your vault
 - **Revoke Shares** - Remove shared documents you've sent to others
+- **Shared Vaults** - Share a whole folder with other Nostr users as an end-to-end encrypted, multi-member vault (see [Shared Vaults](#shared-vaults))
 
 ### Publishing
 - **Publish as Articles** - Post markdown notes as NIP-23 long-form articles
@@ -153,6 +154,18 @@ Your notes are encrypted with NIP-44 before being published to relays. Only you 
 
 The recipient will see it in their notifications panel and can import it to their vault.
 
+### Shared Vaults
+
+A shared vault keeps one folder of your notebook in sync with other Nostr users. Files are encrypted on your device and stored as content-addressed blobs on Blossom servers. Each writer publishes a signed, encrypted head to your relays, and access is granted through NIP-59 gift-wrapped invitations. The vault owner decides who can read and who can propose edits, resolves conflicts, and can revoke access. Shared vaults implement the [nostrc](https://github.com/chebizarro/nostrc) shared-vault protocol and work alongside, not instead of, the self-sync and document sharing described here.
+
+1. Configure your relays (`wss://`) and Blossom servers (`https://`) in **Settings > Nostr**; new vaults use them as their endpoints
+2. Right-click a folder and choose **Shared vault > Share folder as vault...**
+3. Add recipients by npub, NIP-05 or hex pubkey, choosing **Can read** or **Can propose edits**
+4. The recipient opens the invitation in **Notifications**, checks the owner's key fingerprint and endpoints, and accepts into a new folder
+5. Manage members, conflicts, re-sealing and recovery export from **Shared vault > Manage shared vault**
+
+Vault folders are excluded from legacy sync. Revocation protects new and changed content but does not take back anything a member already downloaded. See [docs/SHARED_VAULTS.md](docs/SHARED_VAULTS.md) for the full guide, protocol, security model and developer notes.
+
 ### Blocking Users
 
 If you receive unwanted shares, you can block users:
@@ -218,6 +231,8 @@ Onyx uses custom Nostr event kinds for encrypted file sync:
 All synced content is encrypted using NIP-44 with a conversation key derived from your own public/private key pair. This means only you can decrypt your notes, and relays only see encrypted blobs.
 
 Shared documents are encrypted to the recipient's public key, so only they can decrypt them.
+
+Shared vaults use a separate protocol: kind 30078 heads, kind 30804 grants inside NIP-59 gift wraps, and encrypted blobs on Blossom. It is described in [docs/SHARED_VAULTS.md](docs/SHARED_VAULTS.md).
 
 ## Tech Stack
 

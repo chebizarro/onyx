@@ -22,7 +22,8 @@ onyx/
 │   ├── lib/                # Utilities and libraries
 │   │   ├── codemirror/     # Editor extensions
 │   │   ├── nostr/          # Nostr protocol integration
-│   │   └── opencode/       # OpenCode SDK client
+│   │   ├── opencode/       # OpenCode SDK client
+│   │   └── vault/          # Shared vaults (docs/SHARED_VAULTS.md)
 │   ├── App.tsx             # Main app component
 │   ├── index.tsx           # Entry point
 │   └── styles.css          # Global styles
@@ -87,6 +88,17 @@ npm run tauri build        # Build production binaries
 - `src/components/Editor.tsx` - Markdown editor component
 - `src/components/OpenCodeChat.tsx` - AI chat interface
 - `src/components/OpenCodeTerminal.tsx` - Terminal emulator (xterm.js)
+
+## Shared Vaults
+
+Folder-scoped E2EE sharing over Nostr and Blossom: a TypeScript port of nostrc's `porthome/v2` protocol. User and developer documentation: `docs/SHARED_VAULTS.md`.
+
+- Code lives in `src/lib/vault/`, layered protocol -> policy -> I/O -> engine; lower layers never import higher ones. UI is `src/components/Vault*.tsx`, `SharedVault*.tsx` and `vault-ui.ts`. Native confined writes are the `managed_*` commands in `src-tauri/src/lib.rs`.
+- Every kind, `d` prefix, HKDF domain and limit belongs in `src/lib/vault/protocol.ts`; local resource budgets go in `budgets.ts`. Do not touch `src/lib/nostr/sync.ts` (legacy sync) for vault work.
+- Tests: `npm test` (Vitest projects `vault` and `components`), `npx vitest run --project vault`, `npm run typecheck`, `(cd src-tauri && cargo test)`. Tests drive relays with explicit EVENT/EOSE/OK frames and injected clocks; never add sleeps.
+- Protocol lock: `node scripts/verify-protocol-lock.mjs /path/to/nostrc` checks the fixture hashes and the pinned nostrc source hashes in `src/lib/vault/protocol-lock.json`. A mismatch needs a compatibility review; never regenerate the lock or the fixtures in `tests/fixtures/vault/` to make it pass.
+- Re-pinning nostrc is a compatibility change: update `protocol.ts` and `protocol-lock.json` together and re-verify (`docs/SHARED_VAULTS.md` section 5.4). Interop results against the C implementation are in section 6.
+- Persisted-state changes must be additive and need a new compat fixture generation (`tests/fixtures/vault/compat/README.md`).
 
 ## External Documentation
 
