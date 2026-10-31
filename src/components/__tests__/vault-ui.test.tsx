@@ -22,6 +22,8 @@ vi.mock('@platform', () => ({ platform: platformMock }));
 
 import Sidebar from '../Sidebar';
 import ShareDialog, { SHARE_VALIDATION_DEBOUNCE_MS } from '../ShareDialog';
+import NotificationsPanel from '../NotificationsPanel';
+import type { SharedDocument } from '../../lib/nostr/types';
 
 const fetchUserProfile = vi.hoisted(() => vi.fn(async (_pubkey: string, _relays: string[]) => null as null | { name?: string; picture?: string }));
 vi.mock('../../lib/nostr/login', () => ({ fetchUserProfile }));
@@ -184,6 +186,26 @@ describe('Sidebar gestures and input focus', () => {
       fireEvent.keyDown(window, { key: 'Escape' });
       expect(document.querySelector('.context-menu')).toBeNull();
     });
+  });
+});
+
+describe('NotificationsPanel failed profile lookups', () => {
+  it.each(['empty', 'rejected'])('does not retry a %s lookup on reactive updates', async outcome => {
+    if (outcome === 'rejected') fetchUserProfile.mockRejectedValueOnce(new Error('offline'));
+    else fetchUserProfile.mockResolvedValueOnce(null);
+    const doc: SharedDocument = {
+      eventId: 'event', d: 'document', title: 'Shared note', senderPubkey: BOB,
+      createdAt: 1, isRead: false,
+      data: { path: 'note.md', content: '', checksum: '', sharedBy: { pubkey: BOB }, sharedAt: 1 },
+    };
+    const [docs, setDocs] = createSignal([doc]);
+    render(() => <NotificationsPanel sharedDocuments={docs()} isLoading={false}
+      onPreview={() => undefined} onRefresh={() => undefined} onClose={() => undefined} />);
+    await waitFor(() => expect(fetchUserProfile).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    setDocs([{ ...doc, isRead: true }]);
+    await Promise.resolve();
+    expect(fetchUserProfile).toHaveBeenCalledTimes(1);
   });
 });
 

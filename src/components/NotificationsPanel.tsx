@@ -32,6 +32,9 @@ const NotificationsPanel: Component<NotificationsPanelProps> = (props) => {
   const [senderProfiles, setSenderProfiles] = createSignal<Map<string, NostrProfile>>(new Map());
   const [fetchingProfiles, setFetchingProfiles] = createSignal<Set<string>>(new Set());
 
+  // Failed and empty lookups are terminal for this panel, just like successful ones.
+  const attemptedProfiles = new Set<string>();
+
   // Fetch profiles for all unique senders
   createEffect(() => {
     const docs = props.sharedDocuments;
@@ -40,10 +43,12 @@ const NotificationsPanel: Component<NotificationsPanelProps> = (props) => {
     
     // Get unique sender pubkeys we haven't fetched yet
     const pubkeysToFetch = [...new Set(docs.map(d => d.senderPubkey))]
-      .filter(pk => !profiles.has(pk) && !fetching.has(pk));
+      .filter(pk => !attemptedProfiles.has(pk) && !profiles.has(pk) && !fetching.has(pk));
     
     if (pubkeysToFetch.length === 0) return;
     
+    pubkeysToFetch.forEach(pk => attemptedProfiles.add(pk));
+
     // Mark as fetching
     setFetchingProfiles(prev => {
       const next = new Set(prev);
