@@ -1,0 +1,109 @@
+{
+  "source": "libporthome/tests/test_chunker.c",
+  "input": {
+    "length": 4194304,
+    "generator": {
+      "name": "xorshift32",
+      "seed": "0x12345678",
+      "wordBits": 32,
+      "operations": [
+        {
+          "op": "xor-left-shift",
+          "bits": 13
+        },
+        {
+          "op": "xor-logical-right-shift",
+          "bits": 17
+        },
+        {
+          "op": "xor-left-shift",
+          "bits": 5
+        }
+      ],
+      "maskAfterEachOperation": "0xffffffff",
+      "output": "low 8 bits of updated state"
+    }
+  },
+  "cutEnds": [
+    165895,
+    292695,
+    1059416,
+    1296655,
+    1382158,
+    1668025,
+    2021376,
+    2424373,
+    2854952,
+    2984429,
+    3085032,
+    3389663,
+    3482846,
+    4145571,
+    4194304
+  ],
+  "insertion": {
+    "offset": 1024,
+    "text": "inserted content for locality test!!!!",
+    "bytesHex": "696e73657274656420636f6e74656e7420666f72206c6f63616c697479207465737421212121",
+    "length": 38,
+    "cutEnds": [
+      165933,
+      292733,
+      1059454,
+      1296693,
+      1382196,
+      1668063,
+      2021414,
+      2424411,
+      2854990,
+      2984467,
+      3085070,
+      3389701,
+      3482884,
+      4145609,
+      4194342
+    ]
+  },
+  "degenerate": [
+    {
+      "input": "i % 64",
+      "length": 4194304,
+      "firstCut": 1048576
+    },
+    {
+      "input": "zero",
+      "length": 4194304,
+      "firstCut": 65536
+    },
+    {
+      "input": "zero",
+      "length": 1,
+      "firstCut": 1
+    },
+    {
+      "input": "zero",
+      "length": 65535,
+      "firstCut": 65535
+    },
+    {
+      "input": "zero",
+      "length": 65536,
+      "firstCut": 65536
+    },
+    {
+      "input": "zero",
+      "length": 0,
+      "firstCut": 0
+    },
+    {
+      "input": null,
+      "length": 0,
+      "firstCut": 0
+    },
+    {
+      "input": null,
+      "length": 100,
+      "firstCut": 0
+    }
+  ]
+}

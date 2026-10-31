@@ -1,0 +1,13 @@
+[
+  { "path": ".config", "isDirectory": true },
+  { "path": ".config/empty", "isDirectory": true },
+  { "path": ".config/settings.json", "isDirectory": false },
+  { "path": ".env", "isDirectory": false },
+  { "path": "archive.bin", "isDirectory": false },
+  { "path": "empty", "isDirectory": true },
+  { "path": "nested", "isDirectory": true },
+  { "path": "nested/.hidden", "isDirectory": false },
+  { "path": "nested/audio.mp3", "isDirectory": false },
+  { "path": "note.md", "isDirectory": false },
+  { "path": "notes.txt", "isDirectory": false }
+]

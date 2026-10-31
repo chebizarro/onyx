@@ -1,0 +1,127 @@
+{
+  "source": "libporthome/tests/test_pad_buckets.c",
+  "cases": [
+    {
+      "plain": 0,
+      "padded": 32
+    },
+    {
+      "plain": 1,
+      "padded": 32
+    },
+    {
+      "plain": 31,
+      "padded": 32
+    },
+    {
+      "plain": 32,
+      "padded": 32
+    },
+    {
+      "plain": 33,
+      "padded": 64
+    },
+    {
+      "plain": 63,
+      "padded": 64
+    },
+    {
+      "plain": 64,
+      "padded": 64
+    },
+    {
+      "plain": 65,
+      "padded": 96
+    },
+    {
+      "plain": 95,
+      "padded": 96
+    },
+    {
+      "plain": 96,
+      "padded": 96
+    },
+    {
+      "plain": 97,
+      "padded": 128
+    },
+    {
+      "plain": 255,
+      "padded": 256
+    },
+    {
+      "plain": 256,
+      "padded": 256
+    },
+    {
+      "plain": 257,
+      "padded": 320
+    },
+    {
+      "plain": 319,
+      "padded": 320
+    },
+    {
+      "plain": 320,
+      "padded": 320
+    },
+    {
+      "plain": 321,
+      "padded": 384
+    },
+    {
+      "plain": 511,
+      "padded": 512
+    },
+    {
+      "plain": 512,
+      "padded": 512
+    },
+    {
+      "plain": 513,
+      "padded": 640
+    },
+    {
+      "plain": 65535,
+      "padded": 65536
+    },
+    {
+      "plain": 65536,
+      "padded": 65536
+    },
+    {
+      "plain": 65537,
+      "padded": 81920
+    },
+    {
+      "plain": 262144,
+      "padded": 262144
+    },
+    {
+      "plain": 262145,
+      "padded": 327680
+    },
+    {
+      "plain": 1048576,
+      "padded": 1048576
+    }
+  ],
+  "plaintextGenerator": {
+    "length": 1048576,
+    "byteExpression": "(i % 255) + 1"
+  },
+  "adversarial": {
+    "wrongTrueLengths": [
+      "plain-1 (when plain>0)",
+      "padded+1"
+    ],
+    "distinctPlaintextsHex": [
+      "78",
+      "7800"
+    ],
+    "nullKeyExpectedError": "ARG",
+    "nullNonemptyPlaintextExpectedError": "ARG",
+    "overIntMaxExpectedError": "TOO_LARGE",
+    "oversizedLength": 2147483648
+  }
+}

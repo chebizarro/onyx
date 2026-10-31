@@ -1,0 +1,60 @@
+{
+  "source": "libporthome/tests/test_seal_v2.c",
+  "nodeKeyHex": "6c94a54de3167fb03de876d5764aea1be2e29202f0a327798c29deca20948d14",
+  "chunks": [
+    {
+      "name": "empty",
+      "plaintextHex": "",
+      "sealedHex": "0226809564499106596a9f18169cdc77a69fb310bd96f28a962b92800f78eb8130e8c8bc6888680c52ea9c9a91aebe8a49630e040410c8bbc9850e2926",
+      "address": "66a051107eaf6bfaad6d3a2d46228c19e903aa78ab2c72b6ed0942a1134a955b",
+      "epoch": "3"
+    },
+    {
+      "name": "text",
+      "plaintextHex": "736861726564207661756c74205043532076320a",
+      "sealedHex": "020c7561865ae0ab7fc0af846aee333b2056b51b6647f6896bc0e36b27d7c757aac3f51c7f19bb9ab723b32dfa18464171a69614aca6b9b5bbe546c1a7",
+      "address": "81d541623c41de9fdee71f94e3ce854bda447722a2bdb183d7f5df6b5eae61b4",
+      "epoch": "3"
+    },
+    {
+      "name": "trailing-zero",
+      "plaintextHex": "6100",
+      "sealedHex": "0286f61591f1108800761e913374dd684e54cfb2434eab1fb634587e3c90e8de1a585185094b621cb69e1bce6029f0bc31ab03cd1c2dc51f9fc94ad82a",
+      "address": "5714531823eb0fbba6f6baf9bb64758465f4a673e094dd559f3f7c595ee14789",
+      "epoch": "3"
+    },
+    {
+      "name": "binary-00-through-40",
+      "plaintextHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+      "sealedHex": "02dabb3ddb0c7f95663abab8885d563265b5479cc3588bc383f3a424cb187ad3d08c4fc04e4a289fdcc8421947e6b4a4cf54a86570452c6a4423744571ea518c25d4be8029f12707274c0214495af4a985e60f8aa28a9a87cabdad14945117865bdb062b6e4d67c70dfdd071484f5ba6c8eaf2e67b2ee03de6a78b6567",
+      "address": "f383b7350894ac925d35759e0c9dca482b8e2b4c184337dadf767e02b09633bc",
+      "epoch": "3"
+    }
+  ],
+  "manifest": {
+    "plaintextHex": "a1617801",
+    "epoch": "1",
+    "sealedHex": "026ee674a59a34654effb8954a263ee30c528405c427f447cc62e262f7ae7adc4b",
+    "address": "95155aa446f02385dd25e81332ae6635b8ecf12479116da61cf378cc24958124"
+  },
+  "legacyRefusal": {
+    "wireVersion": 1,
+    "keyHex": "8ca5194b0eac0a08ed4d8dccda5027902680303c0d1be6a59be4c4d35b1a5f5d",
+    "sealedHex": "01ec4b043e7329a5aa63010a79b6d0c4f543d979514a500785b03c0cd3754184270b898d900dd3f9eb658f0ee52e91e5cc",
+    "address": "0aeb3f3813e92b3a27297db8ddb87af9c055a0e4694b319a72207843cc392af5",
+    "expectedError": "VERSION"
+  },
+  "adversarial": {
+    "eachChunk": {
+      "flipEachByteFrom": 1,
+      "flipMask": 1,
+      "allTruncatedLengths": "0..sealedLength-1",
+      "wrongDomain": "manifest",
+      "expectedError": "CRYPTO"
+    },
+    "manifest": {
+      "flipLastByteMask": 1,
+      "expectedError": "CRYPTO"
+    }
+  }
+}
