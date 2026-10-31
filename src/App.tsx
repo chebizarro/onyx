@@ -842,7 +842,7 @@ const App: Component = () => {
 
   // Fetch shared documents from relays
   const fetchSharedDocuments = async () => {
-    const login = getCurrentLogin();
+    const login = await getCurrentLogin();
     if (!login) return;
 
     setIsLoadingShares(true);
