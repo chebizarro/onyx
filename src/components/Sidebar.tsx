@@ -1,8 +1,21 @@
-import { Component, createSignal, createEffect, For, Show, onMount, onCleanup } from 'solid-js';
+import { Component, createSignal, createEffect, createMemo, For, Show, onMount, onCleanup } from 'solid-js';
 import { platform } from '@platform';
 import type { FileEntry } from '@platform';
 import { isMobile } from '../lib/platform';
 import { searchFileContents } from '../lib/editor/note-index';
+import type { VaultId } from '../lib/vault/types';
+import {
+  AUTHORITY_LABELS, containsMount, findMountForPath, isReservedVaultArtifactName, toNotebookRelative,
+  type SharedVaultMountInfo, type VaultPathOperation,
+} from './vault-ui';
+import './vault.css';
+
+/** Drop the reserved vault artifact folders so web matches Tauri's dotfile hiding. */
+function withoutVaultArtifacts(entries: FileEntry[]): FileEntry[] {
+  return entries
+    .filter((entry) => !isReservedVaultArtifactName(entry.name))
+    .map((entry) => (entry.children ? { ...entry, children: withoutVaultArtifacts(entry.children) } : entry));
+}
 
 /**
  * WebKit honours the `autofocus` attribute only once per document, so the inline
@@ -56,6 +69,14 @@ interface SidebarProps {
   onExpandedFoldersChange?: (folders: Set<string>) => void;
   // In-memory cache of all .md contents (path -> content) for zero-IPC search
   fileContents?: Map<string, string>;
+  // Shared vaults. Paths passed to these callbacks are notebook-relative with `/` separators.
+  sharedVaultMounts?: readonly SharedVaultMountInfo[];
+  onCreateSharedVault?: (path: string) => void;
+  onAttachSharedVault?: (path: string) => void;
+  onManageSharedVault?: (vaultId: VaultId) => void;
+  onSyncSharedVault?: (vaultId: VaultId) => void;
+  /** Extra policy check; built-in guards for managed roots and read-only vaults always apply. */
+  canMutatePath?: (path: string, operation: VaultPathOperation) => boolean;
 }
 
 interface SearchResult {
@@ -133,6 +154,63 @@ const Sidebar: Component<SidebarProps> = (props) => {
   const [showVaultMenu, setShowVaultMenu] = createSignal(false);
   const [deleteConfirm, setDeleteConfirm] = createSignal<{ path: string; name: string } | null>(null);
   const [moveConfirm, setMoveConfirm] = createSignal<{ sourcePath: string; destPath: string; name: string } | null>(null);
+  const [vaultNotice, setVaultNotice] = createSignal<{ message: string; vaultId: VaultId | null } | null>(null);
+
+  // Shared vault helpers
+  const caseInsensitivePaths = () => !!props.vaultPath && /^(?:[a-z]:|\/\/|\\\\)/i.test(props.vaultPath);
+  const relativeOf = (path: string): string | null =>
+    props.vaultPath ? toNotebookRelative(path, props.vaultPath) : null;
+  const vaultMountFor = (path: string) => {
+    const mounts = props.sharedVaultMounts;
+    const rel = relativeOf(path);
+    if (!mounts?.length || rel === null) return null;
+    return findMountForPath(rel, mounts, caseInsensitivePaths());
+  };
+  const OPERATION_VERBS: Record<VaultPathOperation, string> = {
+    create: 'adding items to', rename: 'renaming', move: 'moving', delete: 'deleting',
+  };
+  /** Returns a reason when the operation must be blocked, otherwise null. */
+  const vaultBlockReason = (path: string, operation: VaultPathOperation): { message: string; vaultId: VaultId | null } | null => {
+    const rel = relativeOf(path);
+    if (rel === null) return null;
+    const mounts = props.sharedVaultMounts ?? [];
+    const match = mounts.length ? findMountForPath(rel, mounts, caseInsensitivePaths()) : null;
+    const verb = OPERATION_VERBS[operation];
+    if (match?.isRoot && operation !== 'create') {
+      return { message: `This folder is a shared vault. Detach the vault before ${verb} it.`, vaultId: match.mount.vaultId };
+    }
+    if (operation !== 'create' && containsMount(rel, mounts, caseInsensitivePaths())) {
+      return { message: `This folder contains a shared vault. Detach the vault before ${verb} it.`, vaultId: null };
+    }
+    if (match && match.mount.authority === 'reader') {
+      return { message: 'This shared vault is read-only on this device.', vaultId: match.mount.vaultId };
+    }
+    if (props.canMutatePath && !props.canMutatePath(rel, operation)) {
+      return { message: 'This change is not allowed in a shared vault right now.', vaultId: match?.mount.vaultId ?? null };
+    }
+    return null;
+  };
+  /** Context-menu folder that is (inside) a managed vault. */
+  const menuVaultMatch = () => {
+    const menu = contextMenu();
+    return menu?.isDir ? vaultMountFor(menu.path) : null;
+  };
+  /** Notebook-relative folder that may become a new vault, or null (nested/overlapping/root). */
+  const menuVaultCreatePath = (): string | null => {
+    const menu = contextMenu();
+    if (!menu?.isDir || props.sharedVaultMounts === undefined || menuVaultMatch()) return null;
+    const rel = relativeOf(menu.path);
+    if (!rel || containsMount(rel, props.sharedVaultMounts, caseInsensitivePaths())) return null;
+    return rel;
+  };
+  const allowVaultMutation = (path: string, operation: VaultPathOperation): boolean => {
+    const reason = vaultBlockReason(path, operation);
+    if (reason) {
+      setVaultNotice(reason);
+      return false;
+    }
+    return true;
+  };
 
   const openVault = async () => {
     try {
@@ -169,7 +247,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   const loadFiles = async (path: string) => {
     try {
       const entries = await platform.vault.list(path);
-      setFiles(entries);
+      setFiles(withoutVaultArtifacts(entries));
     } catch (err) {
       console.error('Failed to load files:', err);
     }
@@ -296,6 +374,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   };
 
   const handleCreateFile = async (parentPath: string) => {
+    if (!allowVaultMutation(parentPath, 'create')) { closeContextMenu(); return; }
     revealFolder(parentPath);
     setIsCreating({ parentPath, type: 'file' });
     setNewItemName('');
@@ -303,6 +382,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   };
 
   const handleCreateFolder = async (parentPath: string) => {
+    if (!allowVaultMutation(parentPath, 'create')) { closeContextMenu(); return; }
     revealFolder(parentPath);
     setIsCreating({ parentPath, type: 'folder' });
     setNewItemName('');
@@ -343,6 +423,13 @@ const Sidebar: Component<SidebarProps> = (props) => {
     const createSep = creating.parentPath.includes('\\') ? '\\' : '/';
     const fullPath = `${creating.parentPath}${createSep}${newItemName()}${creating.type === 'file' && !newItemName().endsWith('.md') ? '.md' : ''}`;
 
+    // Recheck the final destination: the entered name may contain separators.
+    if (!allowVaultMutation(creating.parentPath, 'create') || !allowVaultMutation(fullPath, 'create')) {
+      setIsCreating(null);
+      setNewItemName('');
+      return;
+    }
+
     try {
       if (creating.type === 'file') {
         await platform.vault.createFile(fullPath, props.vaultPath ?? '');
@@ -360,6 +447,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   };
 
   const handleRename = (path: string, currentName: string) => {
+    if (!allowVaultMutation(path, 'rename')) { closeContextMenu(); return; }
     setIsRenaming(path);
     // Strip .md extension for display in rename input
     setRenameValue(currentName.replace(/\.md$/i, ''));
@@ -381,6 +469,12 @@ const Sidebar: Component<SidebarProps> = (props) => {
     const sep = oldPath.includes('\\') ? '\\' : '/';
     const newPath = `${parentPath}${sep}${newName}`;
 
+    if (!allowVaultMutation(oldPath, 'rename') || !allowVaultMutation(newPath, 'create')) {
+      setIsRenaming(null);
+      setRenameValue('');
+      return;
+    }
+
     try {
       await platform.vault.rename(oldPath, newPath, props.vaultPath ?? '');
       props.onFileMoved?.(oldPath, newPath);
@@ -397,6 +491,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   };
 
   const handleDelete = (path: string) => {
+    if (!allowVaultMutation(path, 'delete')) { closeContextMenu(); return; }
     const name = path.replace(/\\/g, '/').split('/').pop() || 'this item';
     setDeleteConfirm({ path, name });
     closeContextMenu();
@@ -405,6 +500,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   const confirmDelete = async () => {
     const item = deleteConfirm();
     if (!item) return;
+    if (!allowVaultMutation(item.path, 'delete')) { setDeleteConfirm(null); return; }
 
     try {
       await platform.vault.remove(item.path, props.vaultPath ?? '');
@@ -424,6 +520,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
     const copyName = `${baseName} copy${ext}`;
     const copySep = path.includes('\\') ? '\\' : '/';
     const destPath = `${parentPath}${copySep}${copyName}`;
+    if (!allowVaultMutation(destPath, 'create')) { closeContextMenu(); return; }
 
     try {
       await platform.vault.copy(path, destPath, props.vaultPath ?? '');
@@ -462,6 +559,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
   };
 
   const handleMoveTo = async (sourcePath: string) => {
+    if (!allowVaultMutation(sourcePath, 'move')) { closeContextMenu(); return; }
     try {
       const selected = await platform.dialog.open({
         directory: true,
@@ -472,7 +570,9 @@ const Sidebar: Component<SidebarProps> = (props) => {
       if (selected && typeof selected === 'string') {
         const fileName = sourcePath.replace(/\\/g, '/').split('/').pop() || '';
         const destPath = `${selected}/${fileName}`;
-        setMoveConfirm({ sourcePath, destPath, name: fileName });
+        if (allowVaultMutation(destPath, 'create')) {
+          setMoveConfirm({ sourcePath, destPath, name: fileName });
+        }
       }
     } catch (err) {
       console.error('Failed to move:', err);
@@ -483,6 +583,10 @@ const Sidebar: Component<SidebarProps> = (props) => {
   const confirmMove = async () => {
     const move = moveConfirm();
     if (!move) return;
+    if (!allowVaultMutation(move.sourcePath, 'move') || !allowVaultMutation(move.destPath, 'create')) {
+      setMoveConfirm(null);
+      return;
+    }
 
     try {
       await platform.vault.rename(move.sourcePath, move.destPath, props.vaultPath ?? '');
@@ -525,6 +629,8 @@ const Sidebar: Component<SidebarProps> = (props) => {
     // Don't move if already in this directory
     const sourceParent = getParentPath(sourcePath);
     if (sourceParent === targetPath) return;
+
+    if (!allowVaultMutation(sourcePath, 'move') || !allowVaultMutation(newPath, 'create')) return;
 
     setMoveConfirm({ sourcePath, destPath: newPath, name: fileName });
   };
@@ -655,6 +761,25 @@ const Sidebar: Component<SidebarProps> = (props) => {
     searchRequestId++; // discard any in-flight fallback search
   });
 
+  const provisionalIndex = createMemo(() => {
+    const normalize = (path: string) => caseInsensitivePaths() ? path.toLowerCase() : path;
+    return new Map((props.sharedVaultMounts ?? []).map(mount => {
+      const paths = new Set(mount.provisionalPaths.map(normalize));
+      const other = new Set(mount.provisionalOtherPaths.map(normalize));
+      const folders = new Map<string, number>(), otherFolders = new Map<string, number>();
+      for (const path of paths) {
+        let slash = path.lastIndexOf('/');
+        while (slash >= mount.relativePath.length) {
+          const folder = path.slice(0, slash);
+          folders.set(folder, (folders.get(folder) ?? 0) + 1);
+          if (other.has(path)) otherFolders.set(folder, (otherFolders.get(folder) ?? 0) + 1);
+          slash = folder.lastIndexOf('/');
+        }
+      }
+      return [mount.vaultId, { paths, other, folders, otherFolders }] as const;
+    }));
+  });
+
   const FileTreeItem: Component<{ entry: FileEntry; depth: number }> = (itemProps) => {
     const isExpanded = () => expandedFolders().has(itemProps.entry.path);
     const isActive = () => props.currentFile === itemProps.entry.path;
@@ -662,6 +787,45 @@ const Sidebar: Component<SidebarProps> = (props) => {
     const isDragging = () => draggedItem() === itemProps.entry.path;
     const isDropTarget = () => dropTarget() === itemProps.entry.path;
     const typeInfo = () => getFileTypeInfo(itemProps.entry.name, itemProps.entry.isDirectory);
+    const vaultMatch = () => vaultMountFor(itemProps.entry.path);
+    const vaultBadges = () => {
+      const match = vaultMatch();
+      if (!match) return [];
+      const { mount, isRoot } = match;
+      const badges: { text: string; cls: string; title: string }[] = [];
+      if (isRoot) {
+        badges.push({
+          text: 'Vault',
+          cls: `vault-root-badge vault-badge--${mount.authority}`,
+          title: `Shared vault${mount.label ? ` "${mount.label}"` : ''}: ${AUTHORITY_LABELS[mount.authority]}`,
+        });
+        if (mount.conflictCount > 0) {
+          badges.push({ text: `${mount.conflictCount}`, cls: 'vault-root-badge vault-badge--conflict', title: `${mount.conflictCount} conflict(s)` });
+        }
+        if (!mount.enabled) badges.push({ text: 'Paused', cls: 'vault-root-badge vault-badge--paused', title: 'Syncing paused' });
+      }
+      if (mount.authority === 'reader') {
+        badges.push({ text: 'Read-only', cls: `${isRoot ? 'vault-root-badge' : 'vault-inherited-badge'} vault-badge--reader`, title: 'Read-only shared vault' });
+      }
+      const indexed = provisionalIndex().get(mount.vaultId);
+      const relative = relativeOf(itemProps.entry.path)!;
+      const path = caseInsensitivePaths() ? relative.toLowerCase() : relative;
+      const count = isRoot ? mount.provisionalCount : itemProps.entry.isDirectory
+        ? indexed?.folders.get(path) ?? (indexed?.paths.has(path) ? 1 : 0) : indexed?.paths.has(path) ? 1 : 0;
+      if (count) {
+        const other = !isRoot && (itemProps.entry.isDirectory
+          ? (indexed?.otherFolders.get(path) ?? (indexed?.other.has(path) ? 1 : 0)) === count : indexed?.other.has(path));
+        const truncated = mount.provisionalCount > mount.provisionalPaths.length;
+        badges.push({
+          text: isRoot ? `${count} pending owner review` : itemProps.entry.isDirectory
+            ? `${count}${truncated ? '+' : ''} ${other ? 'pending owner review' : 'provisional'}` : other ? 'Pending owner review' : 'Provisional',
+          cls: `${isRoot ? 'vault-root-badge' : 'vault-inherited-badge'} vault-badge--${other ? 'provisional-other' : 'provisional'}`,
+          title: other ? "Another writer's changes not yet in the owner checkpoint" : isRoot || itemProps.entry.isDirectory
+            ? 'Paths not yet in the owner checkpoint' : 'Your changes not yet in the owner checkpoint',
+        });
+      }
+      return badges;
+    };
 
     return (
       <>
@@ -682,6 +846,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
             }
           }}
           onContextMenu={(e) => handleContextMenu(e, itemProps.entry.path, itemProps.entry.isDirectory)}
+          data-vault-root={vaultMatch()?.isRoot ? vaultMatch()!.mount.vaultId : undefined}
         >
           <span>{itemProps.entry.isDirectory ? (isExpanded() ? '▼' : '▶') : '📄'}</span>
           <Show
@@ -706,6 +871,9 @@ const Sidebar: Component<SidebarProps> = (props) => {
             <Show when={typeInfo().badge}>
               <span class="file-type-badge">{typeInfo().badge}</span>
             </Show>
+            <For each={vaultBadges()}>
+              {(badge) => <span class={`vault-badge ${badge.cls}`} title={badge.title}>{badge.text}</span>}
+            </For>
           </Show>
         </div>
         <Show when={itemProps.entry.isDirectory && isExpanded()}>
@@ -955,6 +1123,19 @@ const Sidebar: Component<SidebarProps> = (props) => {
                 />
               </div>
             </Show>
+            <Show when={vaultNotice()}>
+              {(notice) => (
+                <div class="sidebar-vault-notice" role="alert">
+                  <span class="sidebar-vault-notice__text">{notice().message}</span>
+                  <Show when={notice().vaultId && props.onManageSharedVault}>
+                    <button class="vault-link-button" onClick={() => { props.onManageSharedVault?.(notice().vaultId!); setVaultNotice(null); }}>
+                      Manage
+                    </button>
+                  </Show>
+                  <button class="vault-link-button" aria-label="Dismiss" onClick={() => setVaultNotice(null)}>Dismiss</button>
+                </div>
+              )}
+            </Show>
             <For each={files()}>
               {(entry) => <FileTreeItem entry={entry} depth={0} />}
             </For>
@@ -1142,6 +1323,40 @@ const Sidebar: Component<SidebarProps> = (props) => {
             <div class="context-menu-item" onClick={() => handleCreateFolder(contextMenu()!.path)}>
               New folder
             </div>
+            <div class="context-menu-divider" />
+          </Show>
+
+          {/* Shared vault options for folders */}
+          <Show when={menuVaultMatch()}>
+            {(m) => (
+              <>
+                <div class="context-menu-label">Shared vault</div>
+                <Show when={props.onManageSharedVault}>
+                  <div class="context-menu-item" onClick={() => { const id = m().mount.vaultId; closeContextMenu(); props.onManageSharedVault?.(id); }}>
+                    Manage shared vault
+                  </div>
+                </Show>
+                <Show when={props.onSyncSharedVault && m().mount.enabled}>
+                  <div class="context-menu-item" onClick={() => { const id = m().mount.vaultId; closeContextMenu(); props.onSyncSharedVault?.(id); }}>
+                    Sync shared vault
+                  </div>
+                </Show>
+                <div class="context-menu-divider" />
+              </>
+            )}
+          </Show>
+          <Show when={menuVaultCreatePath() !== null && (props.onCreateSharedVault || props.onAttachSharedVault)}>
+            <div class="context-menu-label">Shared vault</div>
+            <Show when={props.onCreateSharedVault}>
+              <div class="context-menu-item" onClick={() => { const rel = menuVaultCreatePath(); closeContextMenu(); if (rel) props.onCreateSharedVault?.(rel); }}>
+                Share folder as vault...
+              </div>
+            </Show>
+            <Show when={props.onAttachSharedVault}>
+              <div class="context-menu-item" onClick={() => { const rel = menuVaultCreatePath(); closeContextMenu(); if (rel) props.onAttachSharedVault?.(rel); }}>
+                Attach existing vault...
+              </div>
+            </Show>
             <div class="context-menu-divider" />
           </Show>
 

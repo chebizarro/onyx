@@ -84,6 +84,7 @@ const webPlugins =
 
 export default defineConfig({
   plugins: [solid(), ...webPlugins],
+  worker: { format: 'es' },
   clearScreen: false,
   resolve: {
     alias: {

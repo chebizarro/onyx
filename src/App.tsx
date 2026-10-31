@@ -1,4 +1,4 @@
-import { Component, createSignal, createEffect, createResource, on, For, Show, onMount, onCleanup, lazy } from 'solid-js';
+import { Component, createSignal, createEffect, createResource, on, untrack, For, Show, onMount, onCleanup, lazy } from 'solid-js';
 import Sidebar from './components/Sidebar';
 import Editor from './components/Editor';
 import QuickSwitcher from './components/QuickSwitcher';
@@ -18,6 +18,15 @@ import ShareDialog from './components/ShareDialog';
 import NotificationsPanel from './components/NotificationsPanel';
 import SharedDocPreview from './components/SharedDocPreview';
 import SentSharesPanel from './components/SentSharesPanel';
+import VaultShareDialog from './components/VaultShareDialog';
+import VaultInvitationDialog from './components/VaultInvitationDialog';
+import VaultPanel from './components/VaultPanel';
+import VaultConflictsPanel from './components/VaultConflictsPanel';
+import SharedVaultSettings from './components/SharedVaultSettings';
+import RecoveryPassphraseFields, { recoveryPassphraseValid } from './components/RecoveryPassphraseFields';
+import SharedVaultEngineStatus from './components/SharedVaultEngineStatus';
+import { EMPTY_VAULT_SNAPSHOT, defaultProfileRelays, sharedVaultMountsFromSnapshot, type VaultPathOperation } from './components/vault-ui';
+import './components/vault.css';
 import FileInfoDialog from './components/FileInfoDialog';
 import PostToNostrDialog from './components/PostToNostrDialog';
 const DocxViewer = lazy(() => import('./components/DocxViewer'));
@@ -31,8 +40,13 @@ import { initPlatform, usePlatformInfo, isWeb } from './lib/platform';
 import { getOpenClawToken } from './lib/ai-credentials';
 import { impactLight, impactMedium, notificationSuccess, notificationError } from './lib/haptics';
 import { platform } from '@platform';
-import { getSyncEngine, getCurrentLogin, calculateChecksum } from './lib/nostr';
-import { getSignerFromStoredLogin } from './lib/nostr/signer';
+import { getSyncEngine, getCurrentLogin, getCurrentLoginWithAuth, calculateChecksum, DEFAULT_SYNC_CONFIG } from './lib/nostr';
+import { getVaultEngine, type VaultEngine, type VaultEngineSnapshot, type VaultEditorBarrier, type VaultRecoveryPassphraseRequest } from './lib/vault/engine-api';
+import { createManagedPathResolver, isManagedPath, intersectsManagedMount } from './lib/vault/legacy-exclusion';
+import { VaultError } from './lib/vault/errors';
+import { hashAddress, hex32 } from './lib/vault/crypto';
+import type { Address, EventId, MountRegistry, Pubkey, VaultId } from './lib/vault/types';
+import { createSignerFromLogin, getSignerFromStoredLogin } from './lib/nostr/signer';
 import { sanitizeFilePath } from './lib/security';
 import { buildNoteIndex, resolveWikilink, NoteIndex, NoteGraph, buildNoteGraphFromContents, readContentsParallel } from './lib/editor/note-index';
 import { openDailyNote, loadDailyNotesConfig } from './lib/daily-notes';
@@ -248,7 +262,8 @@ const App: Component = () => {
   };
 
   // Unread count for notifications badge
-  const unreadShareCount = () => sharedWithMe().filter(d => !d.isRead).length;
+  const unreadShareCount = () => sharedWithMe().filter(d => !d.isRead).length
+    + (vaultSnapshot()?.invitations.filter(i => !i.read && !i.dismissed && !i.accepted).length ?? 0);
 
   // Auto-save timer
   let autoSaveTimeout: number | null = null;
@@ -258,6 +273,304 @@ const App: Component = () => {
 
   // Debounce timer for file watcher
   let fileChangeDebounce: number | null = null;
+
+  const [vaultEngine, setVaultEngine] = createSignal<VaultEngine>();
+  const [vaultSnapshot, setVaultSnapshot] = createSignal<VaultEngineSnapshot>();
+  const [vaultError, setVaultError] = createSignal<string | null>(null);
+  const [identityVersion, setIdentityVersion] = createSignal(0);
+  const [vaultPubkey, setVaultPubkey] = createSignal<Pubkey>();
+  const [showVaults, setShowVaults] = createSignal(false);
+  const [selectedVaultId, setSelectedVaultId] = createSignal<VaultId>();
+  const [conflictsVaultId, setConflictsVaultId] = createSignal<VaultId>();
+  const [shareVault, setShareVault] = createSignal<{ folder: string; vaultId?: VaultId }>();
+  const [invitationId, setInvitationId] = createSignal<EventId>();
+  const [attachFolder, setAttachFolder] = createSignal<string>();
+  const [recoveryPrompt, setRecoveryPrompt] = createSignal(false);
+  const [recoveryRequest, setRecoveryRequest] = createSignal<VaultRecoveryPassphraseRequest>();
+  const [recoveryPassphrase, setRecoveryPassphrase] = createSignal('');
+  const [recoveryConfirmation, setRecoveryConfirmation] = createSignal('');
+  const [recoverySaveError, setRecoverySaveError] = createSignal<string>();
+  const [recoveryPicking, setRecoveryPicking] = createSignal(false);
+  let recoveryDestination: { path: string; generation: number } | undefined;
+  const getRecoveryDestination = () => recoveryDestination;
+  let finishRecoveryPrompt: ((value: string | null) => void) | undefined;
+  const closeRecoveryPrompt = (value: string | null = null) => {
+    finishRecoveryPrompt?.(value);
+    finishRecoveryPrompt = undefined;
+    setRecoveryPassphrase('');
+    setRecoveryConfirmation('');
+    setRecoveryPrompt(false);
+    setRecoveryRequest(undefined);
+  };
+  let recoveryActive = false;
+  const exportVaultRecovery = async (id: VaultId) => {
+    if (recoveryActive) throw new Error('Another recovery export is still running. Wait for it to finish.');
+    recoveryActive = true;
+    recoveryDestination = undefined;
+    try {
+      const engine = vaultEngine();
+      if (!engine) throw new Error('Vault session closed');
+      const pkg = await engine.exportRecovery(id);
+      const destination = getRecoveryDestination();
+      if (!destination || disposed || destination.generation !== sessionGeneration) throw new Error('Vault session changed or recovery save cancelled');
+      await platform.dialog.writeTextFile(destination.path, JSON.stringify(pkg, null, 2));
+    } finally {
+      const unusedDestination = getRecoveryDestination();
+      if (unusedDestination) platform.dialog.discardSave?.(unusedDestination.path);
+      recoveryDestination = undefined;
+      closeRecoveryPrompt();
+      recoveryActive = false;
+    }
+  };
+  const requestRecoveryPassphrase = (request?: VaultRecoveryPassphraseRequest) => new Promise<string | null>(resolve => {
+    closeRecoveryPrompt();
+    recoveryDestination = undefined;
+    setRecoverySaveError(undefined);
+    finishRecoveryPrompt = resolve;
+    setRecoveryRequest(request);
+    setRecoveryPrompt(true);
+  });
+  const selectedVault = () => vaultSnapshot()?.vaults.find(v => v.vaultId === selectedVaultId());
+  const selectedInvitation = () => vaultSnapshot()?.invitations.find(i => i.invitationId === invitationId());
+  const conflictsVault = () => vaultSnapshot()?.vaults.find(v => v.vaultId === conflictsVaultId());
+  const manageSharedVault = (id: VaultId) => { setSelectedVaultId(id); setShowVaults(false); };
+  const openVaultShare = (id: VaultId) => {
+    const vault = vaultSnapshot()?.vaults.find(v => v.vaultId === id);
+    if (vault?.mount) setShareVault({ folder: vault.mount.relativePath, vaultId: id });
+  };
+  const [heldEditors, setHeldEditors] = createSignal<ReadonlySet<string>>(new Set());
+  const mounts: MountRegistry = {
+    getMounts: () => vaultSnapshot()?.vaults.flatMap(vault => vault.mount ? [vault.mount] : []) ?? [],
+  };
+  const managedPath = (path: string) => isManagedPath(path, mounts, platform.info.platform);
+  const legacyPath = (path: string) => !disposed && !intersectsManagedMount(path, mounts, platform.info.platform);
+  const legacyRelativePath = (path: string) => legacyPath(`${vaultPath()}/${path}`);
+  const relativeVaultPath = (path: string) => {
+    const root = (vaultPath() ?? '').replace(/\\/g, '/').replace(/\/$/, '');
+    const normalized = path.replace(/\\/g, '/');
+    return normalized.slice(root.length + 1);
+  };
+  const pathKey = (path: string) => {
+    const slashes = path.normalize('NFC').replace(/\\/g, '/');
+    const components: string[] = [];
+    for (const component of slashes.split('/')) {
+      if (!component || component === '.') continue;
+      if (component === '..' && components.length && components[components.length - 1] !== '..') components.pop();
+      else components.push(component);
+    }
+    const normalized = `${slashes.startsWith('/') ? '/' : ''}${components.join('/')}`;
+    return ['windows', 'macos'].includes(platform.info.platform) ? normalized.toLowerCase() : normalized;
+  };
+  const holds = new Map<string, { done: Promise<void>; release(): void }>();
+  const writes = new Map<string, Promise<unknown>>();
+  const appAbort = new AbortController();
+  let disposed = false;
+  let sessionGeneration = 0;
+  let sessionWork = Promise.resolve();
+  let watcherWork = Promise.resolve();
+  let unsubscribeVault: (() => void) | undefined;
+  const appUnsubscribers: (() => void)[] = [];
+  const trackUnsubscriber = (unsubscribe: () => void) => {
+    if (disposed) unsubscribe(); else appUnsubscribers.push(unsubscribe);
+  };
+
+  const pathsIntersect = (left: string, right: string) => pathKey(left) === pathKey(right)
+    || pathKey(left).startsWith(`${pathKey(right)}/`) || pathKey(right).startsWith(`${pathKey(left)}/`);
+  const holdFor = (path: string) => [...holds.entries()].find(([held]) => pathsIntersect(path, held))?.[1];
+  const editorHeld = (path: string) => [...heldEditors()].some(held =>
+    pathKey(path) === held || pathKey(path).startsWith(`${held}/`));
+  const managedReadOnly = (path: string) => managedPath(path) && !vaultSnapshot()?.vaults.some(vault =>
+    vault.mount && vault.authority !== 'reader' && isManagedPath(path, { getMounts: () => [vault.mount!] }, platform.info.platform));
+
+  // All app-initiated managed writes serialize with materialisation and each other.
+  const writeManaged = async <T,>(path: string, write: () => Promise<T>): Promise<T> => {
+    const key = pathKey(path);
+    const notebook = vaultPath();
+    while (holdFor(path) || writes.has(key)) {
+      if (appAbort.signal.aborted) throw new Error('Vault session closed');
+      await (holdFor(path)?.done ?? writes.get(key));
+    }
+    if (appAbort.signal.aborted) throw new Error('Vault session closed');
+    if (managedReadOnly(path)) throw new Error('Shared vault path is read-only');
+    const operation = Promise.resolve().then(() => {
+      if (appAbort.signal.aborted || notebook !== vaultPath()) throw new Error('Vault session changed');
+      return write();
+    });
+    writes.set(key, operation);
+    try {
+      const result = await operation;
+      if (notebook === vaultPath() && managedPath(path)) vaultEngine()?.notifyFilesChanged([path]);
+      return result;
+    } finally {
+      writes.delete(key);
+    }
+  };
+
+  const canMutateSharedPath = (relative: string, operation: VaultPathOperation) => {
+    const path = `${vaultPath()}/${relative}`;
+    if (holdFor(path) || managedReadOnly(path)) return false;
+    return operation === 'create' || !mounts.getMounts().some(mount =>
+      pathKey(path) === pathKey(`${mount.notebookPath}/${mount.relativePath}`)
+      || pathKey(`${mount.notebookPath}/${mount.relativePath}`).startsWith(`${pathKey(path)}/`));
+  };
+
+  const editorBarrier: VaultEditorBarrier = {
+    async enter(paths, signal) {
+      const root = vaultPath();
+      if (!root || signal.aborted || disposed) throw new Error('Vault session closed');
+      const affected = paths.map(path => `${root}/${path}`);
+      for (const path of affected) {
+        if (holdFor(path)) throw new Error('Shared vault editor already held');
+      }
+      let unlock!: () => void;
+      const done = new Promise<void>(resolve => { unlock = resolve; });
+      let released = false;
+      let unlocked = false;
+      let timer: number | undefined;
+      const unlockEditors = () => {
+        if (unlocked) return;
+        unlocked = true;
+        clearTimeout(timer);
+        signal.removeEventListener('abort', abort);
+        appAbort.signal.removeEventListener('abort', abort);
+        for (const path of affected) holds.delete(pathKey(path));
+        setHeldEditors(new Set(holds.keys()));
+        unlock();
+        if (disposed) return;
+        refreshSidebar?.();
+        // Reschedule autosaves cancelled on entry, including unaffected tabs.
+        if (tabs().some(tab => tab.isDirty)) {
+          autoSaveTimeout = window.setTimeout(() => {
+            tabs().forEach((tab, index) => { if (tab.isDirty) void saveTab(index); });
+          }, 2000);
+        }
+      };
+      const release = () => {
+        if (released) return;
+        released = true;
+        // Refresh before unblocking input/saves, still within the original 5 s
+        // deadline. Never replace dirty content or a tab changed during the read.
+        const refreshes = tabs().filter(tab => !tab.isDirty && tab.fileType === 'markdown'
+          && affected.some(path => pathsIntersect(tab.path, path))).map(tab =>
+          platform.vault.read(tab.path, root).then(content => {
+            if (!disposed && !unlocked && vaultPath() === root) setTabs(prev => prev.map(current =>
+              current === tab ? { ...current, content } : current));
+          }).catch(err => console.error('Failed to refresh shared tab:', err)));
+        void Promise.all(refreshes).finally(unlockEditors);
+      };
+      let rejectHold!: (reason: Error) => void;
+      const expired = new Promise<never>((_, reject) => { rejectHold = reject; });
+      const abort = () => {
+        rejectHold(new Error('Shared vault editor hold aborted'));
+        released = true;
+        unlockEditors();
+      };
+      signal.addEventListener('abort', abort, { once: true });
+      appAbort.signal.addEventListener('abort', abort, { once: true });
+      timer = window.setTimeout(() => {
+        setVaultError('Shared vault editor hold exceeded 5 seconds');
+        rejectHold(new Error('Shared vault editor hold exceeded 5 seconds'));
+        released = true;
+        unlockEditors();
+      }, 5000);
+      for (const path of affected) holds.set(pathKey(path), { done, release });
+      setHeldEditors(new Set(holds.keys()));
+      if (autoSaveTimeout) { clearTimeout(autoSaveTimeout); autoSaveTimeout = null; }
+      try {
+        const flushedHashes = await Promise.race([expired, (async () => {
+          const hashes = new Map<string, Address>();
+          await Promise.all([...writes.entries()].filter(([path]) => affected.some(held => pathsIntersect(path, held))).map(([, write]) => write));
+          if (released) throw new Error('Shared vault editor hold expired');
+          for (const tab of tabs().filter(tab => affected.some(path => pathsIntersect(tab.path, path)) && managedPath(tab.path))) {
+            await writes.get(pathKey(tab.path));
+            if (released) throw new Error('Shared vault editor hold expired');
+            if (tabs().find(current => current.path === tab.path)?.isDirty) {
+              const content = await persistTab(tab.path);
+              hashes.set(relativeVaultPath(tab.path), hashAddress(new TextEncoder().encode(content)));
+            }
+          }
+          return hashes;
+        })()]);
+        return { flushedHashes, release };
+      } catch (err) {
+        setVaultError(`Shared vault flush failed: ${String(err)}`);
+        release();
+        throw err;
+      }
+    },
+  };
+
+  const createSharedVault = (folder: string) => {
+    if (vaultSnapshot()?.lifecycle === 'running') setShareVault({ folder });
+    else { setAttachFolder(undefined); setShowVaults(true); }
+  };
+  const attachSharedVault = (folder: string) => {
+    setAttachFolder(vaultSnapshot()?.lifecycle === 'running' ? folder : undefined);
+    setShowVaults(true);
+  };
+  const refreshVaultIdentity = async () => {
+    setIdentityVersion(version => version + 1);
+    await Promise.resolve();
+    await sessionWork;
+  };
+  createEffect(() => {
+    const path = vaultPath();
+    const loaded = settingsLoaded();
+    const locked = webLocked();
+    identityVersion();
+    const generation = ++sessionGeneration;
+    // Cancel an in-flight start now, not behind the promise it must abort.
+    const stopping = untrack(() => vaultEngine()?.stop());
+    void stopping?.catch(() => {});
+    sessionWork = sessionWork.then(async () => {
+      closeRecoveryPrompt();
+      setShareVault(undefined);
+      setInvitationId(undefined);
+      setAttachFolder(undefined);
+      setSelectedVaultId(undefined);
+      setConflictsVaultId(undefined);
+      setVaultPubkey(undefined);
+      await stopping;
+      if (disposed || generation !== sessionGeneration) return;
+      if (!loaded) { setVaultError('Waiting for notebook settings to load.'); return; }
+      if (!path) { setVaultError('Sign in and open a notebook to use shared vaults.'); return; }
+      if (locked) { setVaultError('The secret store is locked. Unlock it to start shared vaults.'); return; }
+      setVaultError('Starting shared vaults…');
+      const login = await getCurrentLoginWithAuth();
+      if (disposed || generation !== sessionGeneration) return;
+      if (!login) { setVaultError('Sign in or unlock your identity, then retry shared vaults. Biometric authentication may have been cancelled.'); return; }
+      const signer = createSignerFromLogin(login);
+      if (!signer) { setVaultError('Could not load the signer for your identity. Unlock it or sign in again, then retry shared vaults.'); return; }
+      setVaultPubkey(hex32<Pubkey>(login.pubkey));
+      const engine = getVaultEngine({ requestRecoveryPassphrase });
+      if (!unsubscribeVault) {
+        unsubscribeVault = engine.subscribe(snapshot => { if (!disposed) setVaultSnapshot(snapshot); });
+        setVaultEngine(engine);
+      }
+      const storedRelays: (string | { url: string; read: boolean; write: boolean })[] =
+        JSON.parse(localStorage.getItem('nostr_relays') ?? 'null') ?? DEFAULT_SYNC_CONFIG.relays;
+      const relays = storedRelays.map(relay => typeof relay === 'string' ? { url: relay, read: true, write: true } : relay);
+      const blossom: string[] = JSON.parse(localStorage.getItem('blossom_servers') ?? 'null') ?? DEFAULT_SYNC_CONFIG.blossomServers;
+      setVaultError(null);
+      await engine.start({ accountPubkey: hex32<Pubkey>(login.pubkey), signer, notebookPath: path,
+        fs: platform.managedVault, secrets: platform.secrets, editorBarrier,
+        networkDefaults: { readRelays: relays.filter(r => r.read).map(r => r.url),
+          writeRelays: relays.filter(r => r.write).map(r => r.url), readBlossom: blossom, writeBlossom: blossom } }, { requestRecoveryPassphrase });
+    }).catch(err => { if (!disposed && generation === sessionGeneration) setVaultError(`Shared vault engine failed to start: ${String(err)}`); });
+  });
+  onCleanup(() => {
+    disposed = true;
+    ++sessionGeneration;
+    closeRecoveryPrompt();
+    appAbort.abort();
+    unsubscribeVault?.();
+    appUnsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
+    void watcherWork.then(() => platform.vault.stopWatching()).catch(console.error);
+    for (const hold of holds.values()) hold.release();
+    if (autoSaveTimeout) clearTimeout(autoSaveTimeout);
+    if (fileChangeDebounce) clearTimeout(fileChangeDebounce);
+    void vaultEngine()?.stop().catch(console.error);
+  });
 
   // Apply appearance settings from localStorage
   const applyAppearanceSettings = () => {
@@ -306,7 +619,14 @@ const App: Component = () => {
       // Set up Android back button handler using Tauri v2.9+ API
       if (info.platform === 'android') {
         platform.app.onBackButton((event) => {
-          // Handle back navigation in order of priority:
+            // Vault overlays take precedence over editor/history navigation.
+            if (recoveryPrompt()) { closeRecoveryPrompt(); return; }
+            if (shareVault()) { setShareVault(undefined); return; }
+            if (invitationId()) { setInvitationId(undefined); setAttachFolder(undefined); return; }
+            if (conflictsVaultId()) { setConflictsVaultId(undefined); return; }
+            if (selectedVaultId()) { setSelectedVaultId(undefined); return; }
+            if (showVaults()) { setShowVaults(false); return; }
+            // Handle back navigation in order of priority:
           // 1. Close settings modal if open
           if (showSettings()) {
             setShowSettings(false);
@@ -368,7 +688,7 @@ const App: Component = () => {
             return;
           }
           // 10. No more navigation - app will exit (default behavior when handler returns without action)
-        }).catch(err => {
+        }).then(trackUnsubscriber).catch(err => {
           console.error('[App] Failed to register back button handler:', err);
         });
       }
@@ -379,11 +699,11 @@ const App: Component = () => {
 
     // Listen for system theme changes
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    mediaQuery.addEventListener('change', () => {
-      if (localStorage.getItem('theme') === 'system') {
-        applyAppearanceSettings();
-      }
-    });
+    const handleThemeChange = () => {
+      if (localStorage.getItem('theme') === 'system') applyAppearanceSettings();
+    };
+    mediaQuery.addEventListener('change', handleThemeChange);
+    onCleanup(() => mediaQuery.removeEventListener('change', handleThemeChange));
 
     // Load settings asynchronously
     platform.settings.load().then(async (settings) => {
@@ -398,7 +718,7 @@ const App: Component = () => {
           if ((platformInfo.platform === 'android' || platformInfo.platform === 'ios') && platformInfo.default_vault_path) {
             // Create the directory if it doesn't exist
             console.log('[App] Auto-initializing mobile vault at:', platformInfo.default_vault_path);
-            await platform.vault.createFolder(platformInfo.default_vault_path, platformInfo.default_vault_path);
+            await writeManaged(platformInfo.default_vault_path, () => platform.vault.createFolder(platformInfo.default_vault_path!, platformInfo.default_vault_path!));
             vaultToOpen = platformInfo.default_vault_path;
             // Save this as the vault path
             await platform.settings.save({ vault_path: vaultToOpen, show_terminal: false });
@@ -495,7 +815,9 @@ const App: Component = () => {
     let unlistenFn: (() => void) | null = null;
     let unlistenFileModified: (() => void) | null = null;
 
-    platform.vault.onFilesChanged(() => {
+    platform.vault.onFilesChanged((paths) => {
+      if (disposed) return;
+      vaultEngine()?.notifyFilesChanged(paths);
       // Debounce refreshes to avoid too many updates
       if (fileChangeDebounce) {
         clearTimeout(fileChangeDebounce);
@@ -506,20 +828,24 @@ const App: Component = () => {
         fileChangeDebounce = null;
       }, 500);
     }).then(unlisten => {
-      unlistenFn = unlisten;
+      if (disposed) unlisten(); else unlistenFn = unlisten;
     }).catch(err => {
       console.error('[App] Failed to register files-changed watcher:', err);
     });
 
     // Listen for specific file modifications to reload open tabs
     platform.vault.onFileModified(async (modifiedPaths) => {
+      if (disposed) return;
+      vaultEngine()?.notifyFilesChanged(modifiedPaths);
       const currentTabs = tabs();
 
       for (const modifiedPath of modifiedPaths) {
+        if (managedPath(modifiedPath)) continue;
         const tabIndex = currentTabs.findIndex(tab => tab.path === modifiedPath);
         if (tabIndex !== -1 && currentTabs[tabIndex].fileType === 'markdown') {
           try {
             const newContent = await platform.vault.read(modifiedPath, vaultPath() ?? '');
+            if (disposed || managedPath(modifiedPath)) continue;
             const tab = currentTabs[tabIndex];
 
             // If the content is different from what we have, reload it
@@ -547,7 +873,7 @@ const App: Component = () => {
       // the note graph from memory (reads only the modified paths, not the vault)
       refreshContentsForPaths(modifiedPaths);
     }).then(unlisten => {
-      unlistenFileModified = unlisten;
+      if (disposed) unlisten(); else unlistenFileModified = unlisten;
     }).catch(err => {
       console.error('[App] Failed to register file-modified watcher:', err);
     });
@@ -556,7 +882,6 @@ const App: Component = () => {
     onCleanup(() => {
       unlistenFn?.();
       unlistenFileModified?.();
-      platform.vault.stopWatching().catch(() => {});
       if (sharePollingInterval) {
         clearInterval(sharePollingInterval);
       }
@@ -588,19 +913,23 @@ const App: Component = () => {
   const setupDeepLinkHandler = async () => {
     try {
       // Register handler for URLs received while app is running (macOS)
-      await platform.deepLink.onOpenUrl(async (urls: string[]) => {
+      trackUnsubscriber(await platform.deepLink.onOpenUrl(async (urls: string[]) => {
+        if (disposed) return;
         console.log('[DeepLink] onOpenUrl received:', urls);
         for (const url of urls) {
           await handleDeepLink(url);
         }
-      });
+      }));
+      if (disposed) return;
 
       // Listen for deep links from single-instance plugin (Linux/Windows)
       // When a second instance tries to launch, the URL is passed via this event
-      await platform.deepLink.onReceived(async (url) => {
+      trackUnsubscriber(await platform.deepLink.onReceived(async (url) => {
+        if (disposed) return;
         console.log('[DeepLink] Received from single-instance:', url);
         await handleDeepLink(url);
-      });
+      }));
+      if (disposed) return;
 
       // Check if app was launched via deep link (important for Linux/Windows)
       // On these platforms, the URL is passed as CLI argument, not via onOpenUrl
@@ -618,7 +947,7 @@ const App: Component = () => {
         }
       }
       
-      if (launchUrls && launchUrls.length > 0) {
+      if (!disposed && launchUrls && launchUrls.length > 0) {
         console.log('[DeepLink] App launched with URLs:', launchUrls);
         for (const url of launchUrls) {
           await handleDeepLink(url);
@@ -724,7 +1053,7 @@ const App: Component = () => {
     // Use Rust backend commands instead of plugin-fs to avoid FS scope restrictions
     const targetDir = `${vault}/${path}`;
     try {
-      await platform.vault.createFolder(targetDir, vault);
+      await writeManaged(targetDir, () => platform.vault.createFolder(targetDir, vault));
     } catch (err) {
       console.error('[DeepLink] Failed to create directory:', err);
     }
@@ -740,7 +1069,10 @@ const App: Component = () => {
     
     // Save the file
     try {
-      await platform.vault.write(finalPath, content, vault);
+      await writeManaged(finalPath, async () => {
+        if (await platform.vault.exists(finalPath)) throw new Error('Clip destination changed; retry the clip');
+        await platform.vault.write(finalPath, content, vault);
+      });
       console.log('[DeepLink] Clipped to:', finalPath);
       
       // Refresh sidebar to show new file
@@ -837,6 +1169,7 @@ const App: Component = () => {
     // Refresh shared documents if Nostr was set up
     if (result.nostrSetup !== 'skipped') {
       fetchSharedDocuments();
+      await refreshVaultIdentity();
     }
   };
 
@@ -923,18 +1256,21 @@ const App: Component = () => {
       
       // Create Shared directory if it doesn't exist
       const sharedDir = `${vp}/Shared`;
+      if (!legacyPath(sharedDir)) throw new Error('Document import destination intersects a shared vault');
       const dirExists = await platform.dialog.pathExists(sharedDir);
       if (!dirExists) {
+        if (!legacyPath(sharedDir)) throw new Error('Document import destination is managed');
         await platform.dialog.mkdir(sharedDir, true);
       }
 
       // Write file to local filesystem
       const filePath = `${sharedDir}/${filename}`;
+      if (!legacyPath(filePath)) throw new Error('Document import destination is managed');
       await platform.dialog.writeTextFile(filePath, doc.data.content);
       
       // Also sync to Nostr if sync is enabled
       const vault = currentVault();
-      if (vault) {
+      if (vault && legacyPath(filePath) && legacyPath(sharedDir)) {
         try {
           const engine = getSyncEngine();
           await engine.importSharedDocument(doc, vault);
@@ -1028,11 +1364,10 @@ const App: Component = () => {
   // Start/stop file watcher when vault path changes
   createEffect(() => {
     const path = vaultPath();
-    if (path) {
-      platform.vault.startWatching(path).catch(console.error);
-    } else {
-      platform.vault.stopWatching().catch(() => {});
-    }
+    watcherWork = watcherWork.then(async () => {
+      await platform.vault.stopWatching();
+      if (!disposed && path && path === vaultPath()) await platform.vault.startWatching(path);
+    }).catch(console.error);
   });
 
   // Save settings when vault path changes (but not before initial load)
@@ -1336,6 +1671,7 @@ const App: Component = () => {
     const confirm = closeTabConfirm();
     if (!confirm) return;
     await saveTab(confirm.index);
+    if (tabs()[confirm.index]?.isDirty) return;
     doCloseTab(confirm.index);
     setCloseTabConfirm(null);
   };
@@ -1347,28 +1683,35 @@ const App: Component = () => {
     setCloseTabConfirm(null);
   };
 
-  const saveTab = async (index: number) => {
-    const tab = tabs()[index];
-    if (!tab) return;
+  // Shared by ordinary saves and barrier flushes; a failed flush must reject.
+  const persistTab = async (path: string) => {
+    const tab = tabs().find(tab => tab.path === path);
+    if (!tab) throw new Error('Tab closed before save');
+    // Strip the serializer's escapes from literal markdown characters.
+    const content = tab.content.replace(/\\([[\]_!])/g, '$1');
+    await platform.vault.write(path, content, vaultPath() ?? '');
+    setTabs(prev => prev.map(current => current === tab ? { ...current, content, isDirty: false } : current));
+    updateCachedContent(path, content);
+    return content;
+  };
 
+  const saveTab = async (index: number) => {
+    const path = tabs()[index]?.path;
+    if (!path) return;
     try {
-      // Strip remark-stringify escapes from [ ] _ ! before writing to disk.
-      // Milkdown's serializer escapes these characters in text nodes because
-      // they have meaning in raw markdown, but in the WYSIWYG model they are
-      // literal (links, emphasis, images are structural nodes).
-      const content = tab.content.replace(/\\([[\]_!])/g, '$1');
-      await platform.vault.write(tab.path, content, vaultPath() ?? '');
-      setTabs(tabs().map((t, i) => i === index ? { ...t, content, isDirty: false } : t));
-      // Keep the backlinks/graph content cache fresh without any disk read
-      updateCachedContent(tab.path, content);
+      await writeManaged(path, async () => {
+        // A barrier may already have flushed this save while it was queued.
+        if (!managedPath(path) || tabs().find(tab => tab.path === path)?.isDirty) await persistTab(path);
+      });
     } catch (err) {
+      if (managedPath(path)) setVaultError(`Shared vault save failed: ${String(err)}`);
       console.error('Failed to save:', err);
     }
   };
 
   const updateTabContent = (content: string) => {
     const idx = activeTabIndex();
-    if (idx < 0) return;
+    if (idx < 0 || editorHeld(tabs()[idx]?.path ?? '') || managedReadOnly(tabs()[idx]?.path ?? '')) return;
 
     // Strip backslash escapes that Milkdown's remark-stringify adds to [ ] _ !
     // These characters are literal in Milkdown's WYSIWYG model (links, emphasis,
@@ -1484,7 +1827,7 @@ const App: Component = () => {
         console.log('[App] openVault - platform info:', info);
         if (info.default_vault_path) {
           console.log('[App] openVault - creating folder:', info.default_vault_path);
-          await platform.vault.createFolder(info.default_vault_path, info.default_vault_path);
+          await writeManaged(info.default_vault_path, () => platform.vault.createFolder(info.default_vault_path!, info.default_vault_path!));
           setVaultPath(info.default_vault_path);
           localStorage.setItem('vault_path', info.default_vault_path);
           // Refresh sidebar
@@ -1550,7 +1893,7 @@ const App: Component = () => {
     // Ensure vault directory exists
     try {
       console.log('[App] Ensuring vault folder exists:', vault);
-      await platform.vault.createFolder(vault, vault);
+      await writeManaged(vault, () => platform.vault.createFolder(vault!, vault!));
       console.log('[App] Vault folder created/verified');
     } catch (err) {
       console.error('[App] Failed to ensure vault folder exists:', err);
@@ -1575,7 +1918,7 @@ const App: Component = () => {
       console.log('[App] Creating note at:', filepath);
 
       // Create the file with some initial content
-      await platform.vault.createFile(filepath, vault);
+      await writeManaged(filepath, () => platform.vault.createFile(filepath, vault!));
       
       console.log('[App] Note created successfully');
       
@@ -1609,8 +1952,8 @@ const App: Component = () => {
     
     // Track deletion for Nostr sync - store relative path
     const vault = vaultPath();
-    if (vault) {
-      const deletedPaths = JSON.parse(localStorage.getItem('deleted_paths') || '[]') as string[];
+    if (vault && legacyPath(path)) {
+      const deletedPaths = (JSON.parse(localStorage.getItem('deleted_paths') || '[]') as string[]).filter(legacyRelativePath);
       const relativePath = path.replace(vault + '/', '');
       
       // For folder deletions, track all files that were inside
@@ -1624,7 +1967,7 @@ const App: Component = () => {
             // Find all files in vault that start with this folder path
             const folderPrefix = relativePath + '/';
             const filesInFolder = vaultData.data.files
-              .filter(f => f.path === relativePath || f.path.startsWith(folderPrefix))
+              .filter(f => legacyRelativePath(f.path) && (f.path === relativePath || f.path.startsWith(folderPrefix)))
               .map(f => f.path);
             
             for (const filePath of filesInFolder) {
@@ -1654,8 +1997,11 @@ const App: Component = () => {
     const oldRelative = oldPath.replace(vault + '/', '');
     const newRelative = newPath.replace(vault + '/', '');
     
+    if (!legacyPath(oldPath) || !legacyPath(newPath)) return;
+
     // Track the move for Nostr sync
-    const movedPaths = JSON.parse(localStorage.getItem('moved_paths') || '[]') as Array<{ from: string; to: string }>;
+    const movedPaths = (JSON.parse(localStorage.getItem('moved_paths') || '[]') as Array<{ from: string; to: string }>)
+      .filter(move => legacyRelativePath(move.from) && legacyRelativePath(move.to));
     
     // If this file was previously moved (A -> B, now B -> C), update to A -> C
     const existingIdx = movedPaths.findIndex(m => m.to === oldRelative);
@@ -1852,7 +2198,7 @@ const App: Component = () => {
     } else if (resolved.path) {
       // Create new note (no anchor navigation for new notes)
       try {
-        await platform.vault.createFile(resolved.path, vaultPath() ?? '');
+        await writeManaged(resolved.path, () => platform.vault.createFile(resolved.path!, vaultPath() ?? ''));
         await openFile(resolved.path);
         refreshSidebar?.();
       } catch (err) {
@@ -1905,12 +2251,27 @@ const App: Component = () => {
 
       // Get local files with their full paths
       const entries = await platform.vault.list(vaultPath() ?? '');
+      // Spelling cannot see `Alias -> Shared`: the sidebar tree follows links, so
+      // entries the backend marks as links are resolved to their filesystem
+      // identity, and everything listed beneath an alias is judged by that
+      // identity plus its remainder (an alias to a mount's *ancestor* resolves
+      // outside the mount while its descendants resolve inside it) (SV-42).
+      const managed = createManagedPathResolver(mounts, platform.info.platform, platform.vault.realPath?.bind(platform.vault));
 
       const localFiles: { path: string; fullPath: string; content: string }[] = [];
-      const processEntries = async (entries: Array<{ name: string; path: string; isDirectory: boolean; children?: unknown[] }>) => {
+      type WalkEntry = { name: string; path: string; isDirectory: boolean; isSymlink?: boolean; children?: unknown[] };
+      const processEntries = async (entries: WalkEntry[], alias?: { spelled: string; identity: string }) => {
         for (const entry of entries) {
+          let identity = alias ? alias.identity + entry.path.slice(alias.spelled.length) : undefined;
+          if (entry.isSymlink) {
+            // A link whose identity cannot be established is not proven unmanaged.
+            const resolved = await managed.identity(entry.path);
+            if (resolved === null) continue;
+            identity = resolved;
+          }
+          if (managedPath(entry.path) || (identity !== undefined && await managed.isManagedIdentity(identity))) continue;
           if (entry.isDirectory && entry.children) {
-            await processEntries(entry.children as typeof entries);
+            await processEntries(entry.children as WalkEntry[], identity !== undefined ? { spelled: entry.path, identity } : alias);
           } else if (entry.name.endsWith('.md')) {
             const content = await platform.vault.read(entry.path, vaultPath() ?? '');
             const relativePath = entry.path.replace(vaultPath()! + '/', '');
@@ -1921,11 +2282,11 @@ const App: Component = () => {
       await processEntries(entries);
 
       // Get remote files
-      const remoteFiles = await engine.fetchVaultFiles(vault);
+      const remoteFiles = (await engine.fetchVaultFiles(vault)).filter(file => legacyRelativePath(file.data.path));
       const remoteFileMap = new Map(remoteFiles.map(f => [f.data.path, f]));
 
       // Get locally deleted files that need to be synced
-      const locallyDeletedPaths = JSON.parse(localStorage.getItem('deleted_paths') || '[]') as string[];
+      const locallyDeletedPaths = (JSON.parse(localStorage.getItem('deleted_paths') || '[]') as string[]).filter(legacyRelativePath);
       const localFilePathSet = new Set(localFiles.map(f => f.path));
 
       // Sync files - compare timestamps to determine which version is newer
@@ -1938,6 +2299,7 @@ const App: Component = () => {
       const localOnlyFiles: typeof localFiles = [];
 
       for (const localFile of localFiles) {
+        if (!legacyPath(localFile.fullPath)) continue;
         const remoteFile = remoteFileMap.get(localFile.path);
         
         if (remoteFile) {
@@ -1953,11 +2315,13 @@ const App: Component = () => {
               if (remoteModifiedTime > localModifiedTime) {
                 // Remote is newer - download
                 console.log(`[Sync] Downloading newer remote version: ${localFile.path}`);
+                if (!legacyPath(localFile.fullPath)) continue;
                 await platform.vault.write(localFile.fullPath, remoteFile.data.content, vaultPath() ?? '');
                 downloadedCount++;
               } else {
                 // Local is newer or same time - upload
                 console.log(`[Sync] Uploading newer local version: ${localFile.path}`);
+                if (!legacyRelativePath(localFile.path)) continue;
                 const result = await engine.publishFile(vault, localFile.path, localFile.content, remoteFile);
                 vault = result.vault;
                 uploadedCount++;
@@ -1965,6 +2329,7 @@ const App: Component = () => {
             } catch (err) {
               // If we can't get local modified time, default to uploading
               console.warn(`[Sync] Could not get modified time for ${localFile.path}, uploading:`, err);
+              if (!legacyRelativePath(localFile.path)) continue;
               const result = await engine.publishFile(vault, localFile.path, localFile.content, remoteFile);
               vault = result.vault;
               uploadedCount++;
@@ -1982,6 +2347,7 @@ const App: Component = () => {
       const pathsToKeepTracking: string[] = [];
       
       for (const deletedPath of locallyDeletedPaths) {
+        if (!legacyRelativePath(deletedPath)) continue;
         const inRemoteMap = remoteFileMap.has(deletedPath);
         const inLocalFiles = localFilePathSet.has(deletedPath);
         
@@ -2013,10 +2379,12 @@ const App: Component = () => {
 
       // Layer 1: Explicitly tracked moves (from in-app rename/move operations)
       // These are the most reliable -- we know exactly what was moved where.
-      const movedPaths = JSON.parse(localStorage.getItem('moved_paths') || '[]') as Array<{ from: string; to: string }>;
+      const movedPaths = (JSON.parse(localStorage.getItem('moved_paths') || '[]') as Array<{ from: string; to: string }>)
+        .filter(move => legacyRelativePath(move.from) && legacyRelativePath(move.to));
       const movesToKeep: Array<{ from: string; to: string }> = [];
       
       for (const move of movedPaths) {
+        if (!legacyRelativePath(move.from) || !legacyRelativePath(move.to)) continue;
         const remoteFile = remoteFileMap.get(move.from);
         const localFile = localOnlyFiles.find(f => f.path === move.to);
         
@@ -2056,8 +2424,8 @@ const App: Component = () => {
           
           // Look up the remote file by d-tag
           const remoteFile = remoteByDtag.get(knownDtag);
-          if (!remoteFile) continue;
-          
+          if (!remoteFile || !legacyRelativePath(remoteFile.data.path) || !legacyRelativePath(localFile.path)) continue;
+
           // Check if the remote file is at a different path (meaning it wasn't already matched by path)
           if (remoteFile.data.path === localFile.path) continue;
           
@@ -2105,6 +2473,7 @@ const App: Component = () => {
           
           if (candidates && candidates.length > 0) {
             const match = candidates.shift()!;
+            if (!legacyRelativePath(match.path) || !legacyRelativePath(localFile.path)) continue;
             if (candidates.length === 0) {
               remoteByChecksum.delete(localChecksum);
             }
@@ -2131,6 +2500,7 @@ const App: Component = () => {
 
       // Upload remaining local-only files (truly new files)
       for (const localFile of localOnlyFiles) {
+        if (!legacyRelativePath(localFile.path)) continue;
         console.log(`[Sync] Uploading new local file: ${localFile.path}`);
         const result = await engine.publishFile(vault, localFile.path, localFile.content);
         vault = result.vault;
@@ -2140,6 +2510,7 @@ const App: Component = () => {
       // Download remote-only files (files that exist on remote but not locally)
       // Skip files that were deleted locally or are in the vault's deleted list
       for (const [path, remoteFile] of remoteFileMap) {
+        if (!legacyRelativePath(path)) continue;
         // Skip if in vault's deleted list
         if (vault.data.deleted?.some(d => d.path === path)) {
           continue;
@@ -2155,8 +2526,10 @@ const App: Component = () => {
         }
 
         const fullPath = `${vaultPath()}/${path}`;
+        // A legacy path through a local alias would land this write inside a mount.
+        if (!legacyPath(fullPath) || await managed.isManaged(fullPath)) continue;
         const parentDir = fullPath.substring(0, fullPath.lastIndexOf('/'));
-        if (parentDir !== vaultPath()) {
+        if (parentDir !== vaultPath() && legacyPath(parentDir)) {
           await platform.vault.createFolder(parentDir, vaultPath() ?? '').catch(() => {});
         }
         await platform.vault.write(fullPath, remoteFile.data.content, vaultPath() ?? '');
@@ -2167,7 +2540,7 @@ const App: Component = () => {
       // This maps each file's relative path to its stable Nostr d-tag identity
       const updatedDtagMap: Record<string, string> = {};
       for (const fileEntry of vault.data.files) {
-        updatedDtagMap[fileEntry.path] = fileEntry.d;
+        if (legacyRelativePath(fileEntry.path)) updatedDtagMap[fileEntry.path] = fileEntry.d;
       }
       localStorage.setItem('file_dtag_map', JSON.stringify(updatedDtagMap));
 
@@ -2183,9 +2556,10 @@ const App: Component = () => {
         const currentTabs = tabs();
         for (let i = 0; i < currentTabs.length; i++) {
           const tab = currentTabs[i];
-          if (tab.fileType !== 'markdown') continue;
+          if (tab.fileType !== 'markdown' || managedPath(tab.path)) continue;
           try {
             const newContent = await platform.vault.read(tab.path, vaultPath() ?? '');
+            if (disposed || managedPath(tab.path)) continue;
             if (newContent !== tab.content) {
               setTabs(prev => prev.map((t, idx) =>
                 idx === i ? { ...t, content: newContent, isDirty: false } : t
@@ -2220,7 +2594,7 @@ const App: Component = () => {
     }
     
     try {
-      const { path, isNew } = await openDailyNote(vault, config);
+      const { path, isNew } = await writeManaged(`${vault}/${config.folder}`, () => openDailyNote(vault, config));
       console.log('[DailyNotes] Opened daily note:', path, isNew ? '(new)' : '(existing)');
       
       // Open the file in a tab
@@ -2274,12 +2648,12 @@ const App: Component = () => {
     const targetFolder = prompt('Enter folder (or leave empty for root):', '') || '';
     
     try {
-      const notePath = await createNoteFromTemplate(
-        vault,
-        template.path,
-        targetFolder,
-        noteName
-      );
+      // The template helper creates the folder as well as the note. Do not let
+      // that directory operation intersect a mount; normal editor saves can.
+      if (!legacyPath(`${vault}/${targetFolder}/${noteName}.md`) || managedPath(`${vault}/${targetFolder}`)) {
+        throw new Error('Template destination intersects a shared vault');
+      }
+      const notePath = await createNoteFromTemplate(vault, template.path, targetFolder, noteName);
       
       // Open the new note
       const content = await platform.vault.read(notePath, vaultPath() ?? '');
@@ -2557,6 +2931,12 @@ const App: Component = () => {
             expandedFolders={expandedFolders()}
             onExpandedFoldersChange={setExpandedFolders}
             fileContents={fileContents()}
+            sharedVaultMounts={sharedVaultMountsFromSnapshot(vaultSnapshot() ?? EMPTY_VAULT_SNAPSHOT)}
+            canMutatePath={canMutateSharedPath}
+            onCreateSharedVault={createSharedVault}
+            onAttachSharedVault={attachSharedVault}
+            onManageSharedVault={manageSharedVault}
+            onSyncSharedVault={id => { void vaultEngine()?.sync(id).catch(err => setVaultError(String(err))); }}
           />
         </MobileDrawer>
       </Show>
@@ -2764,6 +3144,12 @@ const App: Component = () => {
             expandedFolders={expandedFolders()}
             onExpandedFoldersChange={setExpandedFolders}
             fileContents={fileContents()}
+            sharedVaultMounts={sharedVaultMountsFromSnapshot(vaultSnapshot() ?? EMPTY_VAULT_SNAPSHOT)}
+            canMutatePath={canMutateSharedPath}
+            onCreateSharedVault={createSharedVault}
+            onAttachSharedVault={attachSharedVault}
+            onManageSharedVault={manageSharedVault}
+            onSyncSharedVault={id => { void vaultEngine()?.sync(id).catch(err => setVaultError(String(err))); }}
           />
         </div>
         <div
@@ -2830,7 +3216,7 @@ const App: Component = () => {
         {/* Editor + Terminal horizontal layout */}
         <div class="content-area">
           {/* Editor, Viewer, or Graph View */}
-          <div class="editor-area">
+          <div class="editor-area" inert={!!currentTab() && (editorHeld(currentTab()!.path) || managedReadOnly(currentTab()!.path))}>
             <Show when={currentTab()?.fileType && currentTab()!.fileType !== 'markdown'} fallback={
               <Show when={showGraphView()} fallback={
                 <Editor
@@ -2981,7 +3367,10 @@ const App: Component = () => {
                 sharedDocuments={sharedWithMe()}
                 isLoading={isLoadingShares()}
                 onPreview={handlePreviewSharedDoc}
-                onRefresh={fetchSharedDocuments}
+                vaultInvitations={vaultSnapshot()?.invitations}
+                profileRelays={defaultProfileRelays(vaultSnapshot())}
+                onPreviewVaultInvitation={invitation => { setAttachFolder(undefined); setInvitationId(invitation.invitationId); }}
+                onRefresh={() => { void fetchSharedDocuments(); void vaultEngine()?.refreshInbox().catch(err => setVaultError(String(err))); }}
                 onClose={() => setShowNotifications(false)}
               />
             </div>
@@ -3141,6 +3530,8 @@ const App: Component = () => {
                 </svg>
               </Show>
             </span>
+            <SharedVaultEngineStatus snapshot={vaultSnapshot()} error={vaultError()}
+              onOpen={() => { setAttachFolder(undefined); setShowVaults(true); }} />
             {/* Editor view mode toggle */}
             <Show when={currentTab()}>
               <button
@@ -3151,6 +3542,7 @@ const App: Component = () => {
                   const idx = activeTabIndex();
                   if (idx >= 0) {
                     await saveTab(idx);
+                    if (tabs()[idx]?.isDirty) return;
                     // Reload content from disk into tab state so the other
                     // editor gets the canonical disk version
                     const tab = tabs()[idx];
@@ -3291,6 +3683,23 @@ const App: Component = () => {
 
       <Show when={showSettings()}>
         <Settings
+            vaultEngine={vaultEngine()}
+            sharedVaultSettings={<Show when={vaultEngine()} fallback={<SharedVaultEngineStatus snapshot={vaultSnapshot()} error={vaultError()} onRetry={() => { void refreshVaultIdentity(); }} onRepairInbox={() => { void vaultEngine()?.repairInbox().catch(err => setVaultError(String(err))); }} />}>{engine => (
+              <SharedVaultSettings engine={engine()} snapshot={vaultSnapshot()} onManageVault={manageSharedVault}
+                  startupError={vaultError()} onRetry={() => { void refreshVaultIdentity(); }} onRepairInbox={() => { void vaultEngine()?.repairInbox().catch(err => setVaultError(String(err))); }}
+                deviceKeys={{
+                  get state() { return vaultSnapshot()?.deviceKeys ?? engine().deviceKeys.getState(); },
+                  setEnabled: enabled => engine().deviceKeys.setEnabled(enabled),
+                  setAllowIdentityFallback: allow => engine().deviceKeys.useIdentityFallback(allow),
+                  generate: () => engine().deviceKeys.generate(),
+                  import: secret => engine().deviceKeys.import(secret),
+                  announce: () => engine().deviceKeys.announce(),
+                  approveRecipientKey: (identity, key) => engine().deviceKeys.approveRecipientKey(identity, key),
+                  resetRecipientPin: identity => engine().deviceKeys.resetRecipientPin(identity),
+                }} />
+            )}</Show>}
+            onManageSharedVault={manageSharedVault}
+          onIdentityChange={refreshVaultIdentity}
           onClose={() => {
             setShowSettings(false);
             setSettingsSection(undefined);
@@ -3426,6 +3835,7 @@ const App: Component = () => {
             }
           }}
           onSyncFile={async () => {
+            if (!legacyPath(showFileInfo()!)) throw new VaultError('POLICY', { operation: 'publish' });
             const engine = getSyncEngine();
             let signer = engine.getSigner();
             if (!signer) {
@@ -3510,6 +3920,127 @@ const App: Component = () => {
             await handleRevokeShare(share);
           }}
         />
+      </Show>
+
+      <Show when={showVaults()}>
+        <div class="modal-overlay" onClick={() => setShowVaults(false)}>
+          <section class="modal-dialog vault-dialog" role="dialog" aria-label="Shared vaults" onClick={e => e.stopPropagation()}>
+            <header class="modal-header"><h3>{attachFolder() ? 'Attach owned vault' : 'Shared vaults'}</h3>
+              <button onClick={() => setShowVaults(false)}>Close</button></header>
+            <div class="modal-body vault-dialog__body">
+              <SharedVaultEngineStatus snapshot={vaultSnapshot()} error={vaultError()} onRetry={() => { void refreshVaultIdentity(); }} onRepairInbox={() => { void vaultEngine()?.repairInbox().catch(err => setVaultError(String(err))); }} />
+              <Show when={attachFolder()} fallback={<For each={vaultSnapshot()?.vaults}>{vault => (
+                <button class="vault-btn" onClick={() => manageSharedVault(vault.vaultId)}>{vault.label} — {vault.authority}</button>
+              )}</For>}>
+                <p>Attach at {attachFolder()}. Existing differing files become conflicts; nothing is overwritten. Legacy relay copies remain.</p>
+                <For each={vaultSnapshot()?.vaults.filter(v => v.authority === 'owner' && !v.mount)}>{vault => (
+                  <button class="vault-btn" onClick={async () => {
+                    try { await vaultEngine()?.attach(vault.vaultId, attachFolder()!); setAttachFolder(undefined); manageSharedVault(vault.vaultId); refreshSidebar?.(); }
+                    catch (error) { setVaultError(String(error)); }
+                  }}>Attach {vault.label}</button>
+                )}</For>
+                <p>If the vault is not listed, refresh the inbox for this identity's self-grant.</p>
+              </Show>
+              <button class="vault-btn" disabled={vaultSnapshot()?.lifecycle !== 'running'} onClick={() => { void vaultEngine()?.refreshInbox().catch(err => setVaultError(String(err))); }}>Refresh invitations</button>
+              <button class="vault-btn" onClick={() => { setShowVaults(false); setSettingsSection('sync'); setShowSettings(true); }}>Shared vault settings</button>
+            </div>
+          </section>
+        </div>
+      </Show>
+
+      <Show when={vaultEngine()}>{engine => <>
+        <Show when={selectedVault()}>{vault => (
+          <div class="modal-overlay" onClick={() => setSelectedVaultId(undefined)}>
+            <div class="modal-dialog vault-dialog" role="dialog" aria-label="Manage shared vault" onClick={e => e.stopPropagation()}>
+              <For each={vault().fileErrors}>{failure => <p class="vault-error" role="alert">{failure.path}: {failure.error.message}</p>}</For>
+              <VaultPanel engine={engine()} vaultId={vault().vaultId} snapshot={vaultSnapshot()} localPubkey={vaultPubkey()}
+                members={vault().members} deliveries={vault().deliveries}
+                regrantHeadroom={vault().regrantHeadroomBytes === undefined ? undefined : { largestSealBytes: 65535 - vault().regrantHeadroomBytes! }}
+                onShare={openVaultShare} onOpenConflicts={id => setConflictsVaultId(id)}
+                onDetached={() => { setSelectedVaultId(undefined); refreshSidebar?.(); }}
+                onClose={() => setSelectedVaultId(undefined)}
+                onExportRecovery={exportVaultRecovery} />
+            </div>
+          </div>
+        )}</Show>
+        <Show when={conflictsVault()}>{vault => (
+          <div class="modal-overlay" onClick={() => setConflictsVaultId(undefined)}>
+            <div class="modal-dialog vault-dialog" role="dialog" aria-label="Vault conflicts" onClick={e => e.stopPropagation()}>
+              <VaultConflictsPanel engine={engine()} vaultId={vault().vaultId} snapshot={vaultSnapshot()}
+                conflicts={(vault().conflicts ?? []).map(conflict => ({ ...conflict, kind: conflict.kind === 'directory' ? 'directory' as const : 'file' as const }))}
+                onOpenVersion={conflict => { if (conflict.alternatePath && vaultPath()) void openFile(conflict.alternatePath); }}
+                onClose={() => setConflictsVaultId(undefined)} />
+            </div>
+          </div>
+        )}</Show>
+        <Show when={shareVault()}>{target => (
+          <VaultShareDialog engine={engine()} folderPath={target().folder} vaultId={target().vaultId} localPubkey={vaultPubkey()} snapshot={vaultSnapshot()}
+            deliveryOptions={vaultSnapshot()?.deviceKeys}
+            profileRelays={defaultProfileRelays(vaultSnapshot(), target().vaultId)}
+            existingMembers={vaultSnapshot()?.vaults.find(v => v.vaultId === target().vaultId)?.members}
+            deliveries={vaultSnapshot()?.vaults.find(v => v.vaultId === target().vaultId)?.deliveries}
+            onCreated={id => { refreshSidebar?.(); manageSharedVault(id); }}
+            onClose={() => setShareVault(undefined)} />
+        )}</Show>
+        <Show when={selectedInvitation()}>{invitation => (
+          <Show when={vaultPubkey()}>{pubkey => (
+            <VaultInvitationDialog engine={engine()} invitation={invitation()} localPubkey={pubkey()}
+              endpointHints={invitation().endpointHints ?? { readRelays: [], writeRelays: [], readBlossom: [], writeBlossom: [] }}
+              defaultFolder={`Shared Vaults/${invitation().vaultId.slice(0, 12)}`} attachFolder={attachFolder()}
+              existingMount={vaultSnapshot()?.vaults.find(v => v.vaultId === invitation().vaultId && v.owner === invitation().owner)?.mount ?? undefined}
+              profileRelays={defaultProfileRelays(vaultSnapshot(), invitation().vaultId)}
+              inspectFolder={async relative => {
+                const root = vaultPath();
+                if (!root) throw new Error('Notebook closed');
+                const path = `${root}/${relative}`;
+                if (!await platform.vault.exists(path)) return 'missing';
+                return (await platform.vault.listAll(path)).length ? 'non-empty' : 'empty';
+              }}
+              onAccepted={mount => { setInvitationId(undefined); setAttachFolder(undefined); refreshSidebar?.(); manageSharedVault(mount.vaultId); }}
+              onClose={() => { setInvitationId(undefined); setAttachFolder(undefined); }} />
+          )}</Show>
+        )}</Show>
+      </>}</Show>
+
+      <Show when={recoveryPrompt()}>
+        <div class="modal-overlay">
+          <form class="modal-dialog vault-dialog" role="dialog" aria-label="Recovery passphrase" onSubmit={async event => {
+            event.preventDefault();
+            if (recoveryPicking() || !recoveryPassphraseValid(recoveryPassphrase(), recoveryConfirmation(), recoveryRequest())) return;
+            const generation = sessionGeneration;
+            const root = vaultPath();
+            if (!root) return;
+            setRecoveryPicking(true);
+            setRecoverySaveError(undefined);
+            try {
+              // Open the picker in this user gesture, before NIP-49 encryption.
+              const destination = await platform.dialog.save({ title: 'Save encrypted vault recovery outside all notebooks',
+                defaultPath: `onyx-vault-recovery-${selectedVaultId()?.slice(0, 8) ?? 'backup'}.json`, excludedDirectory: root,
+                filters: [{ name: 'JSON', extensions: ['json'] }] });
+              if (disposed || generation !== sessionGeneration || !recoveryPrompt()) {
+                if (destination) platform.dialog.discardSave?.(destination);
+                return;
+              }
+              if (!destination) { closeRecoveryPrompt(); return; }
+              if (pathKey(destination) === pathKey(root) || pathKey(destination).startsWith(`${pathKey(root)}/`) || managedPath(destination)) {
+                platform.dialog.discardSave?.(destination);
+                throw new Error('Save recovery outside all managed and legacy-synced notebook folders.');
+              }
+              recoveryDestination = { path: destination, generation };
+              closeRecoveryPrompt(recoveryPassphrase());
+            } catch (error) { setRecoverySaveError(String(error)); }
+            finally { setRecoveryPicking(false); }
+          }}>
+            <header class="modal-header"><h3>Protect recovery package</h3></header>
+            <div class="modal-body vault-dialog__body">
+              <p>Use a strong, unique passphrase. Keep it separately from the recovery file. Save the file outside every notebook or synced folder.</p>
+              <RecoveryPassphraseFields request={recoveryRequest()} passphrase={recoveryPassphrase()} confirmation={recoveryConfirmation()} onPassphrase={setRecoveryPassphrase} onConfirmation={setRecoveryConfirmation} />
+              <Show when={recoverySaveError()}><p class="vault-error" role="alert">{recoverySaveError()}</p></Show>
+              <button type="button" onClick={() => closeRecoveryPrompt()}>Cancel</button>
+              <button type="submit" disabled={recoveryPicking() || !recoveryPassphraseValid(recoveryPassphrase(), recoveryConfirmation(), recoveryRequest())}>Choose destination and encrypt</button>
+            </div>
+          </form>
+        </div>
       </Show>
 
       {/* Post to Nostr Dialog */}

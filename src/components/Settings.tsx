@@ -1,4 +1,8 @@
-import { Component, createSignal, For, Show, onMount, onCleanup, createEffect } from 'solid-js';
+import { Component, createSignal, For, Show, onMount, onCleanup, createEffect, type JSX } from 'solid-js';
+import type { VaultEngine, VaultEngineSnapshot } from '../lib/vault/engine-api';
+import { isManagedPath, intersectsManagedMount } from '../lib/vault/legacy-exclusion';
+import type { MountRegistry, VaultId } from '../lib/vault/types';
+import SharedVaultSettings from './SharedVaultSettings';
 import { platform } from '@platform';
 import {
   getSyncEngine,
@@ -85,6 +89,11 @@ interface SettingsProps {
   onSyncComplete?: () => void;
   onSyncEnabledChange?: (enabled: boolean) => void;
   initialSection?: SettingsSection;
+  vaultEngine?: VaultEngine;
+  onManageSharedVault?: (vaultId: VaultId) => void;
+  onIdentityChange?: () => void | Promise<void>;
+  /** Mount point for SharedVaultSettings; independent of legacy sync enablement. */
+  sharedVaultSettings?: JSX.Element;
 }
 
 interface SettingsSectionItem {
@@ -136,6 +145,19 @@ const sections: SettingsSectionItem[] = [
 ];
 
 const Settings: Component<SettingsProps> = (props) => {
+  const [vaultSnapshot, setVaultSnapshot] = createSignal<VaultEngineSnapshot>();
+  const [networkLoaded, setNetworkLoaded] = createSignal(false);
+  let disposed = false;
+  let startupSyncTimeout: number | undefined;
+  const mounts: MountRegistry = {
+    getMounts: () => vaultSnapshot()?.vaults.flatMap(vault => vault.mount ? [vault.mount] : []) ?? [],
+  };
+  const legacyPath = (path: string) => !disposed && !intersectsManagedMount(path, mounts, platform.info.platform);
+  const legacyRelativePath = (path: string) => legacyPath(`${props.vaultPath}/${path}`);
+  createEffect(() => {
+    const unsubscribe = props.vaultEngine?.subscribe(setVaultSnapshot);
+    onCleanup(() => unsubscribe?.());
+  });
   const [activeSection, setActiveSection] = createSignal<SettingsSection>(props.initialSection || 'general');
 
   // Platform detection for hiding OpenCode/Productivity on mobile
@@ -175,6 +197,14 @@ const Settings: Component<SettingsProps> = (props) => {
     DEFAULT_SYNC_CONFIG.blossomServers
   );
   const [newBlossomUrl, setNewBlossomUrl] = createSignal('');
+  createEffect(() => {
+    if (!networkLoaded() || disposed) return;
+    void props.vaultEngine?.updateNetworkDefaults({
+      readRelays: relays().filter(relay => relay.read).map(relay => relay.url),
+      writeRelays: relays().filter(relay => relay.write).map(relay => relay.url),
+      readBlossom: blossomServers(), writeBlossom: blossomServers(),
+    }).catch(err => console.error('Failed to update shared vault network defaults:', err));
+  });
 
   // Blocked users state
   const [blockedUsers, setBlockedUsers] = createSignal<Array<{ pubkey: string; name?: string; picture?: string }>>([]);
@@ -617,7 +647,7 @@ const Settings: Component<SettingsProps> = (props) => {
       }
     };
     mediaQuery.addEventListener('change', handleThemeChange);
-
+    onCleanup(() => mediaQuery.removeEventListener('change', handleThemeChange));
     // Load OpenCode path setting - prefer backend-registered path, fall back to localStorage
     const registeredPath = await platform.opencode.getRegisteredPath().catch(() => null);
     const savedOpenCodePath = registeredPath || localStorage.getItem('opencode_path');
@@ -710,11 +740,14 @@ const Settings: Component<SettingsProps> = (props) => {
       setSyncFrequency(savedSyncFrequency as 'onsave' | '5min' | 'manual');
     }
 
+    if (disposed) return;
+    setNetworkLoaded(true);
+
     // Trigger sync on startup if enabled
     if (savedSyncEnabled === 'true' && savedSyncOnStartup !== 'false') {
       // Delay slightly to let signer initialize
-      setTimeout(() => {
-        if (signer()) {
+      startupSyncTimeout = window.setTimeout(() => {
+        if (!disposed && signer()) {
           handleSyncNow();
         }
       }, 500);
@@ -727,7 +760,7 @@ const Settings: Component<SettingsProps> = (props) => {
 
     // Register the on-save sync callback
     setOnSaveSyncCallback(async () => {
-      if (signer() && syncStatus() !== 'syncing') {
+      if (!disposed && signer() && syncStatus() !== 'syncing') {
         await handleSyncNow();
       }
     });
@@ -738,6 +771,8 @@ const Settings: Component<SettingsProps> = (props) => {
 
   // Cleanup interval on unmount
   onCleanup(() => {
+    disposed = true;
+    clearTimeout(startupSyncTimeout);
     if (syncIntervalId) {
       clearInterval(syncIntervalId);
     }
@@ -1159,6 +1194,7 @@ const Settings: Component<SettingsProps> = (props) => {
     }
 
     await saveLogin(login);
+    await props.onIdentityChange?.();
     setKeyError(null);
     setLoginLoading(false);
 
@@ -1211,6 +1247,7 @@ const Settings: Component<SettingsProps> = (props) => {
 
     // Clear all login data from secure storage
     await clearLogins();
+    await props.onIdentityChange?.();
 
     // Reset sync engine
     const engine = getSyncEngine();
@@ -1375,7 +1412,7 @@ const Settings: Component<SettingsProps> = (props) => {
     }
     // 5 minutes = 300000ms
     syncIntervalId = window.setInterval(() => {
-      if (signer() && syncEnabled() && syncStatus() !== 'syncing') {
+      if (!disposed && signer() && syncEnabled() && syncStatus() !== 'syncing') {
         handleSyncNow();
       }
     }, 300000);
@@ -1435,6 +1472,7 @@ const Settings: Component<SettingsProps> = (props) => {
 
     const processEntries = async (entries: Array<{ name: string; path: string; isDirectory: boolean; children?: unknown[] }>) => {
       for (const entry of entries) {
+        if (isManagedPath(entry.path, mounts, platform.info.platform)) continue;
         if (entry.isDirectory && entry.children) {
           await processEntries(entry.children as typeof entries);
         } else if (entry.name.endsWith('.md')) {
@@ -1452,6 +1490,7 @@ const Settings: Component<SettingsProps> = (props) => {
 
   // Manual sync
   const handleSyncNow = async () => {
+    if (disposed) return;
     if (!signer()) {
       setSyncStatus('error');
       setSyncMessage('No identity found. Please log in first.');
@@ -1485,13 +1524,13 @@ const Settings: Component<SettingsProps> = (props) => {
 
       // Get remote files
       setSyncMessage('Fetching remote files...');
-      const remoteFiles = await engine.fetchVaultFiles(vault);
+      const remoteFiles = (await engine.fetchVaultFiles(vault)).filter(file => legacyRelativePath(file.data.path));
 
       // Create a map of remote files by path
       const remoteFileMap = new Map(remoteFiles.map(f => [f.data.path, f]));
 
       // Get locally deleted files that need to be synced
-      const locallyDeletedPaths = JSON.parse(localStorage.getItem('deleted_paths') || '[]') as string[];
+      const locallyDeletedPaths = (JSON.parse(localStorage.getItem('deleted_paths') || '[]') as string[]).filter(legacyRelativePath);
       const localFilePathSet = new Set(localFiles.map(f => f.path));
 
       // Push local files that are new or changed
@@ -1507,6 +1546,7 @@ const Settings: Component<SettingsProps> = (props) => {
       const localOnlyFiles: typeof localFiles = [];
       
       for (const localFile of localFiles) {
+        if (disposed || !legacyRelativePath(localFile.path)) continue;
         const remoteFile = remoteFileMap.get(localFile.path);
 
         if (remoteFile) {
@@ -1532,6 +1572,7 @@ const Settings: Component<SettingsProps> = (props) => {
       const pathsToKeepTracking: string[] = [];
       
       for (const deletedPath of locallyDeletedPaths) {
+        if (disposed || !legacyRelativePath(deletedPath)) continue;
         const inRemoteMap = remoteFileMap.has(deletedPath);
         const inLocalFiles = localFilePathSet.has(deletedPath);
         
@@ -1561,10 +1602,12 @@ const Settings: Component<SettingsProps> = (props) => {
       const remoteByDtag = new Map(remoteFiles.map(f => [f.d, f]));
 
       // Layer 1: Explicitly tracked moves (from in-app rename/move operations)
-      const movedPaths = JSON.parse(localStorage.getItem('moved_paths') || '[]') as Array<{ from: string; to: string }>;
+      const movedPaths = (JSON.parse(localStorage.getItem('moved_paths') || '[]') as Array<{ from: string; to: string }>)
+        .filter(move => legacyRelativePath(move.from) && legacyRelativePath(move.to));
       const movesToKeep: Array<{ from: string; to: string }> = [];
       
       for (const move of movedPaths) {
+        if (disposed || !legacyRelativePath(move.from) || !legacyRelativePath(move.to)) continue;
         const remoteFile = remoteFileMap.get(move.from);
         const localFile = localOnlyFiles.find(f => f.path === move.to);
         
@@ -1598,8 +1641,7 @@ const Settings: Component<SettingsProps> = (props) => {
           if (!knownDtag) continue;
           
           const remoteFile = remoteByDtag.get(knownDtag);
-          if (!remoteFile) continue;
-          if (remoteFile.data.path === localFile.path) continue;
+          if (!remoteFile || !legacyRelativePath(remoteFile.data.path) || !legacyRelativePath(localFile.path)) continue;          if (remoteFile.data.path === localFile.path) continue;
           if (!remoteFileMap.has(remoteFile.data.path)) continue;
           
           setSyncMessage(`Processing move: ${remoteFile.data.path} -> ${localFile.path}`);
@@ -1641,6 +1683,7 @@ const Settings: Component<SettingsProps> = (props) => {
           
           if (candidates && candidates.length > 0) {
             const match = candidates.shift()!;
+            if (!legacyRelativePath(match.path) || !legacyRelativePath(localFile.path)) continue;
             if (candidates.length === 0) {
               remoteByChecksum.delete(localChecksum);
             }
@@ -1667,6 +1710,7 @@ const Settings: Component<SettingsProps> = (props) => {
 
       // Upload remaining local-only files (truly new files)
       for (const localFile of localOnlyFiles) {
+        if (disposed || !legacyRelativePath(localFile.path)) continue;
         setSyncMessage(`Uploading ${localFile.path}... (${uploadedCount + 1} files)`);
         const result = await engine.publishFile(vault, localFile.path, localFile.content);
         vault = result.vault;
@@ -1679,6 +1723,7 @@ const Settings: Component<SettingsProps> = (props) => {
 
       // Download remote-only files (files on Nostr but not locally)
       for (const [path, remoteFile] of remoteFileMap) {
+        if (disposed || !legacyRelativePath(path)) continue;
         // Skip if in vault's deleted list
         if (vault.data.deleted?.some(d => d.path === path)) {
           continue;
@@ -1698,10 +1743,11 @@ const Settings: Component<SettingsProps> = (props) => {
 
         // Ensure parent directory exists
         const parentDir: string = fullPath.substring(0, fullPath.lastIndexOf('/'));
-        if (parentDir !== props.vaultPath) {
+        if (parentDir !== props.vaultPath && legacyPath(parentDir)) {
           await platform.vault.createFolder(parentDir, props.vaultPath ?? '').catch(() => {});
         }
 
+        if (disposed || !legacyPath(fullPath)) continue;
         await platform.vault.write(fullPath, remoteFile.data.content, props.vaultPath ?? '');
         downloadedCount++;
       }
@@ -1709,7 +1755,7 @@ const Settings: Component<SettingsProps> = (props) => {
       // Persist the d-tag map from the final vault state
       const updatedDtagMap: Record<string, string> = {};
       for (const fileEntry of vault.data.files) {
-        updatedDtagMap[fileEntry.path] = fileEntry.d;
+        if (legacyRelativePath(fileEntry.path)) updatedDtagMap[fileEntry.path] = fileEntry.d;
       }
       localStorage.setItem('file_dtag_map', JSON.stringify(updatedDtagMap));
 
@@ -1773,7 +1819,7 @@ const Settings: Component<SettingsProps> = (props) => {
       const vault = vaults[0];
       
       // Get deleted files from vault index
-      const deletedFiles = vault.data.deleted || [];
+      const deletedFiles = (vault.data.deleted || []).filter(file => legacyRelativePath(file.path));
       
       if (deletedFiles.length === 0) {
         setRecoveryMessage('No deleted files found.');
@@ -1811,7 +1857,7 @@ const Settings: Component<SettingsProps> = (props) => {
   };
 
   const handleRecoverFile = async (file: RecoverableFile) => {
-    if (!props.vaultPath) return;
+    if (disposed || !props.vaultPath || !legacyRelativePath(file.path)) return;
 
     setRecoveringFile(file.path);
     
@@ -1838,10 +1884,12 @@ const Settings: Component<SettingsProps> = (props) => {
       const fullPath = `${props.vaultPath}/${file.path}`;
       const parentDir = fullPath.substring(0, fullPath.lastIndexOf('/'));
       
-      if (parentDir !== props.vaultPath) {
+      if (disposed || !legacyPath(fullPath)) throw new Error('Recovery destination is managed');
+      if (parentDir !== props.vaultPath && legacyPath(parentDir)) {
         await platform.vault.createFolder(parentDir, props.vaultPath ?? '').catch(() => {});
       }
 
+      if (disposed || !legacyPath(fullPath)) throw new Error('Recovery destination is managed');
       await platform.vault.write(fullPath, data.content, props.vaultPath ?? '');
       
       // Remove from recoverable list
@@ -4180,6 +4228,14 @@ const Settings: Component<SettingsProps> = (props) => {
 
             {/* Sync Settings */}
             <Show when={activeSection() === 'sync'}>
+              {/* SharedVaultSettings slot: never gated by syncEnabled(). */}
+              {props.sharedVaultSettings ?? <Show when={props.vaultEngine}>{engine => (
+                <SharedVaultSettings engine={engine()} snapshot={vaultSnapshot()}
+                  onManageVault={props.onManageSharedVault} />
+              )}</Show>}
+              <Show when={vaultSnapshot()?.vaults.some(vault => vault.mount)}>
+                <p>Shared mounts are excluded from legacy sync. Existing relay copies are not retracted.</p>
+              </Show>
               <div class="settings-section">
                 <div class="settings-section-title">Sync Status</div>
 

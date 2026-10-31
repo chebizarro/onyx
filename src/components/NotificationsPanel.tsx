@@ -3,14 +3,21 @@
  * 
  * Shows documents shared with the current user.
  * Displays sender info, document title, and allows preview/import.
+ *
+ * Vault invitations that have not been accepted never load a remote avatar
+ * automatically: the picture URL is chosen by the inviter and loading it
+ * would contact a host of their choosing before the user approved anything.
+ * The owner's key fingerprint is always shown next to the profile name.
  */
 
-import { Component, For, Show, createSignal, createEffect } from 'solid-js';
+import { Component, For, Show, createSignal } from 'solid-js';
 import { formatPubkey } from '../lib/nostr/nip05';
-import { fetchUserProfile } from '../lib/nostr/login';
-import { getSyncEngine } from '../lib/nostr/sync';
 import { sanitizeImageUrl } from '../lib/security';
-import type { SharedDocument, NostrProfile } from '../lib/nostr/types';
+import type { SharedDocument } from '../lib/nostr/types';
+import type { VaultInvitationSummary } from '../lib/vault/engine-api';
+import { createProfileMap, defaultProfileRelays, lookupProfile, shortVaultId, type ProfileLookup } from './vault-ui';
+import KeyFingerprint from './KeyFingerprint';
+import './vault.css';
 
 interface NotificationsPanelProps {
   /** List of shared documents */
@@ -23,69 +30,38 @@ interface NotificationsPanelProps {
   onRefresh: () => void;
   /** Callback when panel is closed */
   onClose: () => void;
+  /** Shared-vault invitations (shown in their own group; dismissed ones are hidden) */
+  vaultInvitations?: readonly VaultInvitationSummary[];
+  /** Callback when a vault invitation is opened for review */
+  onPreviewVaultInvitation?: (invitation: VaultInvitationSummary) => void;
+  /** Relays for profile lookups; defaults to the sync engine's relays */
+  profileRelays?: readonly string[];
+  lookupProfile?: ProfileLookup;
 }
 
 const NotificationsPanel: Component<NotificationsPanelProps> = (props) => {
-  const unreadCount = () => props.sharedDocuments.filter(d => !d.isRead).length;
+  const visibleInvitations = () => (props.vaultInvitations ?? []).filter(inv => !inv.dismissed);
+  const isInvitationUnread = (inv: VaultInvitationSummary) => !inv.read && !inv.accepted;
+  const unreadCount = () => props.sharedDocuments.filter(d => !d.isRead).length
+    + visibleInvitations().filter(isInvitationUnread).length;
+  const totalCount = () => props.sharedDocuments.length + visibleInvitations().length;
+  const showGroups = () => visibleInvitations().length > 0;
 
-  // Cache of fetched sender profiles (pubkey -> profile)
-  const [senderProfiles, setSenderProfiles] = createSignal<Map<string, NostrProfile>>(new Map());
-  const [fetchingProfiles, setFetchingProfiles] = createSignal<Set<string>>(new Set());
+  // Invitations whose owner avatar the user explicitly asked to load (per invitation id).
+  const [avatarsRequested, setAvatarsRequested] = createSignal<ReadonlySet<string>>(new Set());
+  const requestAvatar = (invitationId: string) => {
+    setAvatarsRequested((prev) => new Set(prev).add(invitationId));
+  };
 
-  // Failed and empty lookups are terminal for this panel, just like successful ones.
-  const attemptedProfiles = new Set<string>();
-
-  // Fetch profiles for all unique senders
-  createEffect(() => {
-    const docs = props.sharedDocuments;
-    const profiles = senderProfiles();
-    const fetching = fetchingProfiles();
-    
-    // Get unique sender pubkeys we haven't fetched yet
-    const pubkeysToFetch = [...new Set(docs.map(d => d.senderPubkey))]
-      .filter(pk => !attemptedProfiles.has(pk) && !profiles.has(pk) && !fetching.has(pk));
-    
-    if (pubkeysToFetch.length === 0) return;
-    
-    pubkeysToFetch.forEach(pk => attemptedProfiles.add(pk));
-
-    // Mark as fetching
-    setFetchingProfiles(prev => {
-      const next = new Set(prev);
-      pubkeysToFetch.forEach(pk => next.add(pk));
-      return next;
-    });
-    
-    // Fetch profiles concurrently
-    const engine = getSyncEngine();
-    const relays = engine.getConfig().relays;
-    
-    pubkeysToFetch.forEach(async (pubkey) => {
-      try {
-        const profile = await fetchUserProfile(pubkey, relays);
-        if (profile) {
-          setSenderProfiles(prev => {
-            const next = new Map(prev);
-            next.set(pubkey, {
-              pubkey,
-              name: profile.displayName || profile.name,
-              picture: profile.picture,
-              nip05: profile.nip05,
-            });
-            return next;
-          });
-        }
-      } catch (err) {
-        console.error('Failed to fetch sender profile:', err);
-      } finally {
-        setFetchingProfiles(prev => {
-          const next = new Set(prev);
-          next.delete(pubkey);
-          return next;
-        });
-      }
-    });
-  });
+  // Profiles are looked up once per pubkey (cached, including failures)
+  const senderProfiles = createProfileMap(
+    () => [...new Set([
+      ...props.sharedDocuments.map(d => d.senderPubkey),
+      ...visibleInvitations().map(inv => inv.owner as string),
+    ])],
+    () => props.profileRelays ?? defaultProfileRelays(),
+    props.lookupProfile ?? lookupProfile,
+  );
 
   // Get profile for a sender, with fallback to embedded info
   const getSenderProfile = (doc: SharedDocument): { name?: string; picture?: string } => {
@@ -169,25 +145,103 @@ const NotificationsPanel: Component<NotificationsPanelProps> = (props) => {
       </div>
 
       <div class="notifications-body">
-        <Show when={props.isLoading && props.sharedDocuments.length === 0}>
+        <Show when={props.isLoading && totalCount() === 0}>
           <div class="notifications-loading">
             <div class="spinner"></div>
             <span>Loading shared documents...</span>
           </div>
         </Show>
 
-        <Show when={!props.isLoading && props.sharedDocuments.length === 0}>
+        <Show when={!props.isLoading && totalCount() === 0}>
           <div class="notifications-empty">
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
               <polyline points="14 2 14 8 20 8"></polyline>
             </svg>
-            <p>No documents shared with you yet</p>
-            <span>When someone shares a document, it will appear here</span>
+            <p>Nothing shared with you yet</p>
+            <span>When someone shares a document or vault, it will appear here</span>
+          </div>
+        </Show>
+
+        <Show when={visibleInvitations().length > 0}>
+          <div class="notifications-group-title">Vault invitations</div>
+          <div class="notifications-list" aria-label="Vault invitations">
+            <For each={visibleInvitations()}>
+              {(inv) => {
+                const ownerProfile = () => senderProfiles().get(inv.owner);
+                const remotePicture = () => sanitizeImageUrl(ownerProfile()?.picture);
+                // Accepted invitations belong to a vault the user already approved; anything else needs a click.
+                const avatarAllowed = () => inv.accepted || avatarsRequested().has(inv.invitationId);
+                const avatarSrc = () => (avatarAllowed() ? remotePicture() : undefined);
+                return (
+                  <div
+                    class={`notification-item vault-invitation ${isInvitationUnread(inv) ? 'unread' : 'read'}`}
+                    data-invitation-id={inv.invitationId}
+                    onClick={() => props.onPreviewVaultInvitation?.(inv)}
+                  >
+                    <div class="notification-unread-dot">
+                      <Show when={isInvitationUnread(inv)}>
+                        <span></span>
+                      </Show>
+                    </div>
+                    <div class="notification-avatar">
+                      <Show when={avatarSrc()} fallback={
+                        <Show when={!avatarAllowed() && remotePicture()} fallback={
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                          </svg>
+                        }>
+                          <button
+                            type="button"
+                            class="notification-avatar-load"
+                            aria-label="Load avatar from the inviter's profile"
+                            title="Not loaded: this picture is hosted wherever the inviter chose. Click to load it."
+                            onClick={(e) => { e.stopPropagation(); requestAvatar(inv.invitationId); }}
+                          >
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                              <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                              <polyline points="21 15 16 10 5 21"></polyline>
+                            </svg>
+                          </button>
+                        </Show>
+                      }>
+                        <img src={avatarSrc()} alt="" class="notification-avatar-img" />
+                      </Show>
+                    </div>
+                    <div class="notification-content">
+                      <div class="notification-sender">
+                        {ownerProfile()?.name || formatPubkey(inv.owner, 8)}
+                      </div>
+                      <div class="notification-fingerprint">
+                        <KeyFingerprint pubkey={inv.owner} />
+                      </div>
+                      <div class="notification-title">
+                        Shared vault {shortVaultId(inv.vaultId)}
+                        <span class={`vault-badge vault-badge--${inv.cap === 'write' ? 'writer' : 'reader'}`}>
+                          {inv.cap === 'write' ? 'write' : 'read'}
+                        </span>
+                        <Show when={inv.accepted}>
+                          <span class="vault-badge vault-badge--ok">accepted</span>
+                        </Show>
+                      </div>
+                    </div>
+                    <div class="notification-arrow">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="9 18 15 12 9 6"></polyline>
+                      </svg>
+                    </div>
+                  </div>
+                );
+              }}
+            </For>
           </div>
         </Show>
 
         <Show when={props.sharedDocuments.length > 0}>
+          <Show when={showGroups()}>
+            <div class="notifications-group-title">Document snapshots</div>
+          </Show>
           <div class="notifications-list">
             <For each={props.sharedDocuments}>
               {(doc) => {
