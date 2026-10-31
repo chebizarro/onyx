@@ -34,6 +34,29 @@ impl Default for OpenCodeServerState {
 
 type SharedOpenCodeServerState = Arc<Mutex<OpenCodeServerState>>;
 
+/// The configured notebook root, in the spelling the user chose (settings.json),
+/// held in process so that every vault command validates against *this* and
+/// never against a root the caller hands over per call (SV-40). It follows the
+/// configuration surface the user also sees: the persisted setting at startup,
+/// then `save_settings` / `set_vault_scope`. That removes silent per-call root
+/// selection; it does not stop a hostile webview from reconfiguring the notebook
+/// through those same commands — a natively authorised folder picker is the
+/// follow-up that would.
+#[derive(Default)]
+struct VaultScopeState {
+    notebook: Option<String>,
+}
+
+type SharedVaultScope = Arc<Mutex<VaultScopeState>>;
+
+fn configured_notebook(state: &SharedVaultScope) -> Result<String, String> {
+    state
+        .lock()
+        .notebook
+        .clone()
+        .ok_or_else(|| "No vault is configured".to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AppSettings {
     #[serde(default)]
@@ -177,6 +200,24 @@ fn lexically_normalize(path: &Path) -> Result<PathBuf, String> {
 /// All current call sites use the return value; a new one that does not is an
 /// immediate escape, and nothing but this comment enforces it.
 fn validate_vault_path(path: &str, vault_path: &str) -> Result<PathBuf, String> {
+    contain_in_vault(path, vault_path).map(|(normalized, _root)| normalized)
+}
+
+/// The vault-relative remainder of `path` under the same lexical containment
+/// rule as `validate_vault_path`: empty for the root itself, otherwise only
+/// `Normal` components. This is what the managed (no-follow) primitives walk,
+/// component by component, from the canonical root.
+fn vault_relative_path(path: &str, vault_path: &str) -> Result<PathBuf, String> {
+    let (normalized, root) = contain_in_vault(path, vault_path)?;
+    Ok(normalized
+        .strip_prefix(&root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default())
+}
+
+/// Lexical containment: returns the normalized path together with the root
+/// spelling it was found under. See `validate_vault_path` for the rule.
+fn contain_in_vault(path: &str, vault_path: &str) -> Result<(PathBuf, PathBuf), String> {
     let path = Path::new(path);
     let vault = Path::new(vault_path);
 
@@ -214,17 +255,493 @@ fn validate_vault_path(path: &str, vault_path: &str) -> Result<PathBuf, String> 
         }
     }
 
-    if !allowed_roots
+    // Longest match first: when one spelling of the root is itself a prefix of
+    // another, the relative remainder must be computed from the deeper one.
+    let root = allowed_roots
         .iter()
-        .any(|root| normalized_path.starts_with(root))
-    {
-        return Err(format!(
-            "Access denied: path '{}' is outside the vault directory",
-            path.display()
-        ));
+        .filter(|root| normalized_path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Access denied: path '{}' is outside the vault directory",
+                path.display()
+            )
+        })?;
+
+    Ok((normalized_path, root))
+}
+
+/// Resolve the picked recovery path before writing, including symlink aliases.
+#[tauri::command]
+fn resolve_recovery_destination(path: String, notebook_path: String) -> Result<String, String> {
+    let picked = Path::new(&path);
+    if !picked.is_absolute() {
+        return Err("Recovery destination must be absolute".into());
+    }
+    let notebook_path = Path::new(&notebook_path);
+    if lexically_normalize(picked)?.starts_with(lexically_normalize(notebook_path)?) {
+        return Err("Save recovery outside the notebook and its managed folders".into());
+    }
+    let notebook = notebook_path.canonicalize().map_err(|e| e.to_string())?;
+    let resolved = if picked.exists() || fs::symlink_metadata(picked).is_ok() {
+        picked.canonicalize().map_err(|e| e.to_string())?
+    } else {
+        let parent = picked.parent().ok_or("Recovery destination has no parent")?;
+        let name = picked.file_name().ok_or("Recovery destination has no filename")?;
+        parent.canonicalize().map_err(|e| e.to_string())?.join(name)
+    };
+    if resolved.starts_with(&notebook) {
+        return Err("Save recovery outside the notebook and its managed folders".into());
+    }
+    resolved.to_str().map(str::to_owned).ok_or_else(|| "Recovery path is not UTF-8".into())
+}
+
+// ---------------------------------------------------------------------------
+// Managed (shared-vault) file primitives: race-resistant confinement (SV-32)
+// and atomic installation (SV-39).
+//
+// Accepted shared-view content is written by the engine with names a remote
+// writer chose. The legacy commands above resolve such a name through any
+// symlink the local user once planted (`mount/link -> ~/Private` plus an
+// accepted `link/new.md` lands in `~/Private`). These primitives instead reach
+// every component below the notebook root relative to the previous directory
+// handle with `O_NOFOLLOW`, so the handles themselves prove containment and
+// there is no pre-write `realpath` to race against (TOCTOU).
+// ---------------------------------------------------------------------------
+
+/// Prefix of the temporary file an atomic install writes beside its target.
+/// Capture skips entries with this prefix and materialization refuses remote
+/// entries carrying it (`src/lib/vault/filesystem.ts`), so a crash orphan is
+/// never published as content.
+const MANAGED_TEMP_PREFIX: &str = ".onyx-vault-tmp-";
+
+/// Canonical root plus the lexical remainder below it for a managed operation.
+///
+/// The root is the configured notebook, which may itself be a symlink the user
+/// chose (`~/Vault -> /mnt/data/Vault`): that hop is followed once, here, and
+/// the canonical directory is then opened by pathname. Everything below it is
+/// walked no-follow, so a link at the mount root or anywhere along the
+/// destination fails instead of redirecting.
+///
+/// Threat-model boundary: the notebook root and its ancestors (`/Users/<me>`)
+/// are trusted. Replacing one of them between `canonicalize` and the open needs
+/// the user's own privileges, which already own every file in the notebook; the
+/// race this closes is a link *inside* the notebook meeting a remote-chosen
+/// name. Race resistance is claimed below the root, not above it.
+fn managed_target(notebook: &str, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let relative = vault_relative_path(path, notebook)?;
+    let root = fs::canonicalize(notebook).map_err(|e| format!("Vault root is unavailable: {}", e))?;
+    Ok((root, relative))
+}
+
+/// Splits a non-empty relative path into its parent and final component.
+fn split_target(relative: &Path) -> Result<(&Path, &std::ffi::OsStr), String> {
+    let name = relative
+        .file_name()
+        .ok_or_else(|| "The vault root itself cannot be the target of a managed operation".to_string())?;
+    Ok((relative.parent().unwrap_or(Path::new("")), name))
+}
+
+/// Installs `data` at `path` atomically inside the notebook, creating missing
+/// parent directories (never through a link).
+fn managed_write_bytes(notebook: &str, path: &str, data: &[u8]) -> Result<(), String> {
+    let (root, relative) = managed_target(notebook, path)?;
+    let (parent, name) = split_target(&relative)?;
+    let root = confined::open_root(&root)?;
+    let dir = confined::descend(&root, parent, true)?;
+    confined::write_atomic(&dir, name, |file| std::io::Write::write_all(file, data))
+}
+
+fn managed_read_bytes(notebook: &str, path: &str) -> Result<Vec<u8>, String> {
+    let (root, relative) = managed_target(notebook, path)?;
+    let (parent, name) = split_target(&relative)?;
+    let root = confined::open_root(&root)?;
+    let dir = confined::descend(&root, parent, false)?;
+    confined::read(&dir, name)
+}
+
+fn managed_create_folder(notebook: &str, path: &str) -> Result<(), String> {
+    let (root, relative) = managed_target(notebook, path)?;
+    let root = confined::open_root(&root)?;
+    confined::descend(&root, &relative, true).map(drop)
+}
+
+fn managed_remove(notebook: &str, path: &str) -> Result<(), String> {
+    let (root, relative) = managed_target(notebook, path)?;
+    let (parent, name) = split_target(&relative)?;
+    let root = confined::open_root(&root)?;
+    let dir = confined::descend(&root, parent, false)?;
+    confined::remove(&dir, name)
+}
+
+#[tauri::command]
+fn managed_write_binary(scope: tauri::State<'_, SharedVaultScope>, path: String, data: Vec<u8>) -> Result<(), String> {
+    managed_write_bytes(&configured_notebook(&scope)?, &path, &data)
+}
+
+#[tauri::command]
+fn managed_read_binary(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<tauri::ipc::Response, String> {
+    managed_read_bytes(&configured_notebook(&scope)?, &path).map(tauri::ipc::Response::new)
+}
+
+#[tauri::command]
+fn managed_mkdir(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<(), String> {
+    managed_create_folder(&configured_notebook(&scope)?, &path)
+}
+
+#[tauri::command]
+fn managed_delete(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<(), String> {
+    managed_remove(&configured_notebook(&scope)?, &path)
+}
+
+#[cfg(unix)]
+mod confined {
+    //! Directory-handle-relative primitives. Everything below the root is reached
+    //! through `openat(dirfd, component, O_NOFOLLOW | O_DIRECTORY)`, so the only
+    //! way to a file is through real directories inside the root.
+    use rustix::fs::{fchmod, fsync, mkdirat, openat, renameat, statat, unlinkat, AtFlags, Dir, FileType, Mode, OFlags, RawMode, CWD};
+    use rustix::io::Errno;
+    use std::ffi::{OsStr, OsString};
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub type DirHandle = OwnedFd;
+
+    fn link_error(name: &OsStr) -> String {
+        format!(
+            "Access denied: '{}' is a symbolic link; managed vault paths never follow links",
+            Path::new(name).display()
+        )
     }
 
-    Ok(normalized_path)
+    /// `O_NOFOLLOW` on a link surfaces as `ELOOP` on Linux and, together with
+    /// `O_DIRECTORY`, as `ENOTDIR` on macOS; name the link in either case.
+    fn describe(dir: &DirHandle, name: &OsStr, errno: Errno) -> String {
+        if matches!(errno, Errno::LOOP | Errno::NOTDIR)
+            && matches!(statat(dir, name, AtFlags::SYMLINK_NOFOLLOW), Ok(stat) if FileType::from_raw_mode(stat.st_mode as _) == FileType::Symlink)
+        {
+            return link_error(name);
+        }
+        format!("'{}': {}", Path::new(name).display(), io::Error::from(errno))
+    }
+
+    /// Opens the canonical root: the one place a link (the user's own) is followed.
+    pub fn open_root(root: &Path) -> Result<DirHandle, String> {
+        openat(CWD, root, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|e| format!("Vault root is unavailable: {}", io::Error::from(e)))
+    }
+
+    fn open_dir(dir: &DirHandle, name: &OsStr) -> Result<DirHandle, String> {
+        openat(
+            dir,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| describe(dir, name, e))
+    }
+
+    /// Walks `relative` from `root` one component at a time, never following a
+    /// link. With `create`, missing directories are made on the way: `mkdirat`
+    /// then open, so a link raced into the slot still fails the open. A directory
+    /// this call created is flushed into its parent, so an install beneath it is
+    /// durable as a whole, not just at its last level.
+    pub fn descend(root: &DirHandle, relative: &Path, create: bool) -> Result<DirHandle, String> {
+        let mut dir = root.try_clone().map_err(|e| e.to_string())?;
+        for component in relative.components() {
+            let name = match component {
+                Component::Normal(name) => name,
+                _ => return Err(format!("Invalid managed path component in '{}'", relative.display())),
+            };
+            if create {
+                match mkdirat(&dir, name, Mode::from_raw_mode(0o755)) {
+                    Ok(()) => fsync(&dir).map_err(|e| describe(&dir, name, e))?,
+                    Err(Errno::EXIST) => {}
+                    Err(e) => return Err(describe(&dir, name, e)),
+                }
+            }
+            dir = open_dir(&dir, name)?;
+        }
+        Ok(dir)
+    }
+
+    /// `lstat`-style type of `name` under `dir`; `None` when absent.
+    fn file_type(dir: &DirHandle, name: &OsStr) -> Result<Option<FileType>, String> {
+        match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode as _))),
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(describe(dir, name, e)),
+        }
+    }
+
+    /// Durability of the installed bytes, before the rename makes them live.
+    ///
+    /// Linux: `fsync(2)`; with the directory `fsync` after the rename, both the
+    /// data and the entry are on the device when the command returns.
+    ///
+    /// macOS: `F_FULLFSYNC`. `fsync(2)` there only hands data to the drive
+    /// without flushing its cache, so a power loss could persist the rename and
+    /// not the bytes — and a torn live file would be taken for a local edit by
+    /// the next capture and published. The full flush costs milliseconds per
+    /// file, paid once per materialised file; flushing once per journal batch is
+    /// the optimisation if that ever matters. Volumes that reject the fcntl
+    /// (network shares, FAT) fall back to `fsync`.
+    fn flush_file(file: &File) -> io::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        match rustix::fs::fcntl_fullfsync(file) {
+            Ok(()) => return Ok(()),
+            Err(Errno::NOTSUP) | Err(Errno::INVAL) | Err(Errno::NOTTY) => {}
+            Err(e) => return Err(io::Error::from(e)),
+        }
+        file.sync_all()
+    }
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_name() -> OsString {
+        OsString::from(format!(
+            "{}{}-{}",
+            super::MANAGED_TEMP_PREFIX,
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Installs a file atomically: a fresh `O_EXCL` temporary beside the target is
+    /// filled, flushed, then renamed over `name` within the same directory handle.
+    /// Any failure before the rename leaves the live file untouched and removes
+    /// the temporary. An error from the directory `fsync` after the rename means
+    /// the install is in place but its durability is unconfirmed — callers treat
+    /// every error as "re-verify the path", never as "nothing changed" (the
+    /// materialization journal does exactly that). A crash leaves at most a
+    /// `.onyx-vault-tmp-*` orphan. A regular file being replaced keeps its
+    /// permission bits; a new file gets `0644` under the umask, as `fs::write`
+    /// would.
+    pub fn write_atomic(
+        dir: &DirHandle,
+        name: &OsStr,
+        fill: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<(), String> {
+        let existing = match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Some(stat),
+            Err(Errno::NOENT) => None,
+            Err(e) => return Err(describe(dir, name, e)),
+        };
+        let existing_kind = existing.as_ref().map(|stat| FileType::from_raw_mode(stat.st_mode as _));
+        if existing_kind == Some(FileType::Symlink) {
+            return Err(link_error(name));
+        }
+        let preserved_mode = existing
+            .filter(|_| existing_kind == Some(FileType::RegularFile))
+            .map(|stat| Mode::from_raw_mode((stat.st_mode as RawMode) & 0o7777));
+        let (temp, fd) = loop {
+            let temp = temp_name();
+            match openat(
+                dir,
+                temp.as_os_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o644),
+            ) {
+                Ok(fd) => break (temp, fd),
+                Err(Errno::EXIST) => continue,
+                Err(e) => return Err(describe(dir, &temp, e)),
+            }
+        };
+        let install = || -> io::Result<()> {
+            let mut file = File::from(fd);
+            fill(&mut file)?;
+            if let Some(mode) = preserved_mode {
+                fchmod(&file, mode).map_err(io::Error::from)?;
+            }
+            flush_file(&file)?;
+            drop(file);
+            renameat(dir, temp.as_os_str(), dir, name).map_err(io::Error::from)?;
+            fsync(dir).map_err(io::Error::from)
+        };
+        if let Err(e) = install() {
+            let _ = unlinkat(dir, temp.as_os_str(), AtFlags::empty());
+            return Err(format!("Failed to install '{}': {}", Path::new(name).display(), e));
+        }
+        Ok(())
+    }
+
+    pub fn read(dir: &DirHandle, name: &OsStr) -> Result<Vec<u8>, String> {
+        let fd = openat(dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|e| describe(dir, name, e))?;
+        let mut bytes = Vec::new();
+        File::from(fd)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("'{}': {}", Path::new(name).display(), e))?;
+        Ok(bytes)
+    }
+
+    /// Removes `name` under `dir`: a link is unlinked, never followed; a directory
+    /// is emptied through its own handle before `unlinkat(REMOVEDIR)`.
+    pub fn remove(dir: &DirHandle, name: &OsStr) -> Result<(), String> {
+        let kind = file_type(dir, name)?.ok_or_else(|| describe(dir, name, Errno::NOENT))?;
+        remove_entry(dir, name, kind)
+    }
+
+    fn remove_entry(dir: &DirHandle, name: &OsStr, kind: FileType) -> Result<(), String> {
+        if kind != FileType::Directory {
+            return unlinkat(dir, name, AtFlags::empty()).map_err(|e| describe(dir, name, e));
+        }
+        let child = open_dir(dir, name)?;
+        for (child_name, child_kind) in list(&child)? {
+            let child_kind = match child_kind {
+                Some(kind) => kind,
+                None => file_type(&child, &child_name)?.ok_or_else(|| describe(&child, &child_name, Errno::NOENT))?,
+            };
+            remove_entry(&child, &child_name, child_kind)?;
+        }
+        drop(child);
+        unlinkat(dir, name, AtFlags::REMOVEDIR).map_err(|e| describe(dir, name, e))
+    }
+
+    fn list(dir: &DirHandle) -> Result<Vec<(OsString, Option<FileType>)>, String> {
+        let mut children = Vec::new();
+        for entry in Dir::read_from(dir).map_err(|e| io::Error::from(e).to_string())? {
+            let entry = entry.map_err(|e| io::Error::from(e).to_string())?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let kind = match entry.file_type() {
+                FileType::Unknown => None,
+                kind => Some(kind),
+            };
+            children.push((OsStr::from_bytes(name).to_os_string(), kind));
+        }
+        Ok(children)
+    }
+}
+
+#[cfg(not(unix))]
+mod confined {
+    //! Verify-then-operate fallback: std has no directory-handle-relative open on
+    //! this platform, so each component is checked with `symlink_metadata` before
+    //! use and the install rename is `MoveFileEx(REPLACE_EXISTING)`. The window
+    //! between a check and its use is a known residual here; the Unix module has
+    //! none.
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{self, File};
+    use std::io::{self, Read};
+    use std::path::{Component, Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub struct DirHandle(PathBuf);
+
+    fn link_error(path: &Path) -> String {
+        format!(
+            "Access denied: '{}' is a symbolic link; managed vault paths never follow links",
+            path.display()
+        )
+    }
+
+    pub fn open_root(root: &Path) -> Result<DirHandle, String> {
+        if !root.is_dir() {
+            return Err(format!("Vault root is unavailable: {}", root.display()));
+        }
+        Ok(DirHandle(root.to_path_buf()))
+    }
+
+    fn check_not_link(path: &Path) -> Result<Option<fs::Metadata>, String> {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(link_error(path)),
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("'{}': {}", path.display(), e)),
+        }
+    }
+
+    pub fn descend(root: &DirHandle, relative: &Path, create: bool) -> Result<DirHandle, String> {
+        let mut current = root.0.clone();
+        for component in relative.components() {
+            let name = match component {
+                Component::Normal(name) => name,
+                _ => return Err(format!("Invalid managed path component in '{}'", relative.display())),
+            };
+            current.push(name);
+            match check_not_link(&current)? {
+                Some(meta) if meta.is_dir() => {}
+                Some(_) => return Err(format!("'{}' is not a directory", current.display())),
+                None if create => fs::create_dir(&current).map_err(|e| format!("'{}': {}", current.display(), e))?,
+                None => return Err(format!("'{}': not found", current.display())),
+            }
+        }
+        Ok(DirHandle(current))
+    }
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_name() -> OsString {
+        OsString::from(format!(
+            "{}{}-{}",
+            super::MANAGED_TEMP_PREFIX,
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// `sync_all` is `FlushFileBuffers`; NTFS journals the rename itself, so no
+    /// directory flush is attempted. Only a temporary this call created is ever
+    /// removed on failure; a name a crash orphan still holds is skipped.
+    pub fn write_atomic(
+        dir: &DirHandle,
+        name: &OsStr,
+        fill: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<(), String> {
+        let target = dir.0.join(name);
+        check_not_link(&target)?;
+        let (temp, file) = loop {
+            let temp = dir.0.join(temp_name());
+            match File::options().write(true).create_new(true).open(&temp) {
+                Ok(file) => break (temp, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("'{}': {}", temp.display(), e)),
+            }
+        };
+        let install = |mut file: File| -> io::Result<()> {
+            fill(&mut file)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &target)
+        };
+        if let Err(e) = install(file) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to install '{}': {}", target.display(), e));
+        }
+        Ok(())
+    }
+
+    pub fn read(dir: &DirHandle, name: &OsStr) -> Result<Vec<u8>, String> {
+        let target = dir.0.join(name);
+        check_not_link(&target)?;
+        let mut bytes = Vec::new();
+        File::open(&target)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(|e| format!("'{}': {}", target.display(), e))?;
+        Ok(bytes)
+    }
+
+    pub fn remove(dir: &DirHandle, name: &OsStr) -> Result<(), String> {
+        let target = dir.0.join(name);
+        let meta = fs::symlink_metadata(&target).map_err(|e| format!("'{}': {}", target.display(), e))?;
+        let result = if meta.file_type().is_symlink() {
+            // A directory link needs remove_dir here; neither form follows it.
+            fs::remove_file(&target).or_else(|_| fs::remove_dir(&target))
+        } else if meta.is_dir() {
+            fs::remove_dir_all(&target)
+        } else {
+            fs::remove_file(&target)
+        };
+        result.map_err(|e| format!("'{}': {}", target.display(), e))
+    }
 }
 
 /// Check if a path is within the config directory (for settings, not vault files)
@@ -251,13 +768,23 @@ fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
+fn save_settings(
+    app: AppHandle,
+    scope: tauri::State<'_, SharedVaultScope>,
+    settings: AppSettings,
+) -> Result<(), String> {
     let config_dir = get_config_dir_with_app(&app);
     fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
 
     let path = get_settings_path(&app);
     let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    fs::write(&path, content).map_err(|e| e.to_string())
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    // The persisted configuration is the authority the commands validate against,
+    // and a save replaces the whole file (the frontend always sends every field),
+    // so the in-process copy mirrors it exactly: a save without a vault path
+    // leaves no notebook configured, in the file and here alike.
+    scope.lock().notebook = settings.vault_path;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -266,6 +793,12 @@ pub struct FileEntry {
     path: String,
     #[serde(rename = "isDirectory")]
     is_directory: bool,
+    /// Set on sidebar entries that are symbolic links. The sidebar follows links
+    /// (a linked folder is the owner's grant), so the flag is how the frontend
+    /// knows which entries need filesystem identity, not spelling, to decide
+    /// whether they alias a managed shared-vault mount (SV-42).
+    #[serde(rename = "isSymlink", default, skip_serializing_if = "Option::is_none")]
+    is_symlink: Option<bool>,
     children: Option<Vec<FileEntry>>,
 }
 
@@ -332,6 +865,15 @@ fn build_file_tree(path: &Path) -> Vec<FileEntry> {
 /// recurse until the stack ran out; re-entering a directory we are already
 /// inside is the definition of a cycle, so we stop there.
 fn build_file_tree_inner(path: &Path, visited: &mut Vec<PathBuf>, depth: usize) -> Vec<FileEntry> {
+    build_file_tree_with_filter(path, visited, depth, true)
+}
+
+fn build_file_tree_with_filter(
+    path: &Path,
+    visited: &mut Vec<PathBuf>,
+    depth: usize,
+    sidebar_filter: bool,
+) -> Vec<FileEntry> {
     let mut entries: Vec<FileEntry> = Vec::new();
 
     if depth >= MAX_TREE_DEPTH {
@@ -363,19 +905,27 @@ fn build_file_tree_inner(path: &Path, visited: &mut Vec<PathBuf>, depth: usize) 
             let name = item.file_name().to_string_lossy().to_string();
 
             // Skip hidden files and folders
-            if name.starts_with('.') {
+            if sidebar_filter && name.starts_with('.') {
+                continue;
+            }
+
+            // Capture never follows local symlinks; the sidebar keeps its linked-folder behaviour.
+            let is_symlink = item.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if !sidebar_filter && is_symlink {
                 continue;
             }
 
             let is_dir = item_path.is_dir();
 
             // Only include markdown files, viewable files (images, PDFs, documents), and directories
-            if !is_dir && !name.ends_with(".md") && !is_viewable_extension(&name) {
+            if sidebar_filter && !is_dir && !name.ends_with(".md") && !is_viewable_extension(&name) {
                 continue;
             }
 
             let children = if is_dir {
-                Some(build_file_tree_inner(&item_path, visited, depth + 1))
+                Some(build_file_tree_with_filter(
+                    &item_path, visited, depth + 1, sidebar_filter,
+                ))
             } else {
                 None
             };
@@ -384,6 +934,7 @@ fn build_file_tree_inner(path: &Path, visited: &mut Vec<PathBuf>, depth: usize) 
                 name,
                 path: item_path.to_string_lossy().to_string(),
                 is_directory: is_dir,
+                is_symlink: if is_symlink { Some(true) } else { None },
                 children,
             });
         }
@@ -396,36 +947,72 @@ fn build_file_tree_inner(path: &Path, visited: &mut Vec<PathBuf>, depth: usize) 
     entries
 }
 
+// ---------------------------------------------------------------------------
+// Vault file commands. Each `#[tauri::command]` is a thin wrapper that takes the
+// notebook from `SharedVaultScope` and delegates to a `*_in(notebook, ...)`
+// function; the inner functions are what the unit tests exercise. None of them
+// accepts a root from the caller (SV-40).
+//
+// These are the legacy editor's commands: they follow symbolic links the user
+// created inside the notebook (`writing_a_symlinked_note_writes_through_to_its_target`
+// pins that ruling). The shared-vault engine uses the `managed_*` commands below,
+// which never follow a link below the root.
+// ---------------------------------------------------------------------------
+
 #[tauri::command]
-fn list_files(path: String) -> Result<Vec<FileEntry>, String> {
-    let path = Path::new(&path);
+fn list_files(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<Vec<FileEntry>, String> {
+    list_files_in(&configured_notebook(&scope)?, &path)
+}
+
+fn list_files_in(notebook: &str, path: &str) -> Result<Vec<FileEntry>, String> {
+    let path = validate_vault_path(path, notebook)?;
     if !path.exists() {
         return Err("Path does not exist".to_string());
     }
-    Ok(build_file_tree(path))
+    Ok(build_file_tree(&path))
 }
 
 #[tauri::command]
-fn read_file(path: String, vault_path: Option<String>) -> Result<String, String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for read_file")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn list_files_all(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<Vec<FileEntry>, String> {
+    list_files_all_in(&configured_notebook(&scope)?, &path)
+}
+
+fn list_files_all_in(notebook: &str, path: &str) -> Result<Vec<FileEntry>, String> {
+    let path = validate_vault_path(path, notebook)?;
+    if !path.is_dir() {
+        return Err("Path is not a directory".to_string());
+    }
+    let mut visited = Vec::new();
+    Ok(build_file_tree_with_filter(&path, &mut visited, 0, false))
+}
+
+#[tauri::command]
+fn read_file(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<String, String> {
+    read_file_in(&configured_notebook(&scope)?, &path)
+}
+
+fn read_file_in(notebook: &str, path: &str) -> Result<String, String> {
+    let path = validate_vault_path(path, notebook)?;
     fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for write_file")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn write_file(scope: tauri::State<'_, SharedVaultScope>, path: String, content: String) -> Result<(), String> {
+    write_file_in(&configured_notebook(&scope)?, &path, &content)
+}
+
+fn write_file_in(notebook: &str, path: &str, content: &str) -> Result<(), String> {
+    let path = validate_vault_path(path, notebook)?;
     fs::write(&path, content).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn write_binary_file(path: String, data: Vec<u8>, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for write_binary_file")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn write_binary_file(scope: tauri::State<'_, SharedVaultScope>, path: String, data: Vec<u8>) -> Result<(), String> {
+    write_binary_file_in(&configured_notebook(&scope)?, &path, &data)
+}
+
+fn write_binary_file_in(notebook: &str, path: &str, data: &[u8]) -> Result<(), String> {
+    let path = validate_vault_path(path, notebook)?;
     // Create parent directories if needed
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -434,21 +1021,24 @@ fn write_binary_file(path: String, data: Vec<u8>, vault_path: Option<String>) ->
 }
 
 #[tauri::command]
-fn read_binary_file(path: String, vault_path: Option<String>) -> Result<tauri::ipc::Response, String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for read_binary_file")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn read_binary_file(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<tauri::ipc::Response, String> {
     // Return a raw IPC response so the frontend receives an ArrayBuffer instead of
     // a JSON number array (huge serialization overhead for large files like PDFs).
-    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-    Ok(tauri::ipc::Response::new(bytes))
+    read_binary_file_in(&configured_notebook(&scope)?, &path).map(tauri::ipc::Response::new)
+}
+
+fn read_binary_file_in(notebook: &str, path: &str) -> Result<Vec<u8>, String> {
+    let path = validate_vault_path(path, notebook)?;
+    fs::read(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn create_file(path: String, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for create_file")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn create_file(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<(), String> {
+    create_file_in(&configured_notebook(&scope)?, &path)
+}
+
+fn create_file_in(notebook: &str, path: &str) -> Result<(), String> {
+    let path = validate_vault_path(path, notebook)?;
     if path.exists() {
         return Err("File already exists".to_string());
     }
@@ -459,10 +1049,12 @@ fn create_file(path: String, vault_path: Option<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn create_folder(path: String, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for create_folder")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn create_folder(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<(), String> {
+    create_folder_in(&configured_notebook(&scope)?, &path)
+}
+
+fn create_folder_in(notebook: &str, path: &str) -> Result<(), String> {
+    let path = validate_vault_path(path, notebook)?;
     fs::create_dir_all(&path).map_err(|e| e.to_string())
 }
 
@@ -471,7 +1063,11 @@ fn create_folder(path: String, vault_path: Option<String>) -> Result<(), String>
 /// can access the vault. This is the secure alternative to broadening static fs:scope —
 /// only the specific vault directory chosen by the user is granted access at runtime.
 #[tauri::command]
-fn set_vault_scope(app: AppHandle, vault_path: String) -> Result<(), String> {
+fn set_vault_scope(
+    app: AppHandle,
+    scope: tauri::State<'_, SharedVaultScope>,
+    vault_path: String,
+) -> Result<(), String> {
     use tauri_plugin_fs::FsExt;
     let path = Path::new(&vault_path);
     if !path.exists() || !path.is_dir() {
@@ -494,6 +1090,8 @@ fn set_vault_scope(app: AppHandle, vault_path: String) -> Result<(), String> {
     app.fs_scope()
         .allow_directory(path, true)
         .map_err(|e| format!("Failed to add vault to fs scope: {}", e))?;
+    // Settings spelling, not `canonical`: see `get_configured_vault_setting`.
+    scope.lock().notebook = Some(vault_path.clone());
     println!("[Scope] Added vault to fs scope: {}", vault_path);
     Ok(())
 }
@@ -515,10 +1113,12 @@ fn file_exists(path: String) -> bool {
 }
 
 #[tauri::command]
-fn delete_file(path: String, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate path is within vault
-    let vault = vault_path.ok_or("vault_path is required for delete_file")?;
-    let path = validate_vault_path(&path, &vault)?;
+fn delete_file(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<(), String> {
+    delete_file_in(&configured_notebook(&scope)?, &path)
+}
+
+fn delete_file_in(notebook: &str, path: &str) -> Result<(), String> {
+    let path = validate_vault_path(path, notebook)?;
     if path.is_dir() {
         fs::remove_dir_all(path).map_err(|e| e.to_string())
     } else {
@@ -527,20 +1127,24 @@ fn delete_file(path: String, vault_path: Option<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn rename_file(old_path: String, new_path: String, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate both paths are within vault
-    let vault = vault_path.ok_or("vault_path is required for rename_file")?;
-    let old_path = validate_vault_path(&old_path, &vault)?;
-    let new_path = validate_vault_path(&new_path, &vault)?;
+fn rename_file(scope: tauri::State<'_, SharedVaultScope>, old_path: String, new_path: String) -> Result<(), String> {
+    rename_file_in(&configured_notebook(&scope)?, &old_path, &new_path)
+}
+
+fn rename_file_in(notebook: &str, old_path: &str, new_path: &str) -> Result<(), String> {
+    let old_path = validate_vault_path(old_path, notebook)?;
+    let new_path = validate_vault_path(new_path, notebook)?;
     fs::rename(&old_path, &new_path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn copy_file(source: String, dest: String, vault_path: Option<String>) -> Result<(), String> {
-    // Always validate both paths are within vault
-    let vault = vault_path.ok_or("vault_path is required for copy_file")?;
-    let source_path = validate_vault_path(&source, &vault)?;
-    let dest_path = validate_vault_path(&dest, &vault)?;
+fn copy_file(scope: tauri::State<'_, SharedVaultScope>, source: String, dest: String) -> Result<(), String> {
+    copy_file_in(&configured_notebook(&scope)?, &source, &dest)
+}
+
+fn copy_file_in(notebook: &str, source: &str, dest: &str) -> Result<(), String> {
+    let source_path = validate_vault_path(source, notebook)?;
+    let dest_path = validate_vault_path(dest, notebook)?;
 
     if source_path.is_dir() {
         // Copy directory recursively
@@ -566,6 +1170,40 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Filesystem identity of a notebook path for the legacy-exclusion check (SV-42):
+/// the canonical path when it exists, otherwise the canonical form of its
+/// nearest existing ancestor joined with the remaining components, so a file
+/// about to be created under an alias resolves to where it would really land.
+/// Identity is advisory for the legacy sync's exclusion decision; it is not the
+/// confinement boundary (that is the `managed_*` traversal above).
+#[tauri::command]
+fn resolve_real_path(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<String, String> {
+    resolve_real_path_in(&configured_notebook(&scope)?, &path)
+}
+
+fn resolve_real_path_in(notebook: &str, path: &str) -> Result<String, String> {
+    let normalized = validate_vault_path(path, notebook)?;
+    let mut existing = normalized.as_path();
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    while fs::symlink_metadata(existing).is_err() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| format!("'{}' has no existing ancestor", normalized.display()))?;
+        missing.push(name);
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("'{}' has no existing ancestor", normalized.display()))?;
+    }
+    let mut resolved = fs::canonicalize(existing).map_err(|e| e.to_string())?;
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Path is not UTF-8".to_string())
 }
 
 #[tauri::command]
@@ -678,7 +1316,11 @@ fn get_file_stats(path: String) -> Result<FileStats, String> {
 }
 
 #[tauri::command]
-async fn search_files(app: AppHandle, path: String, query: String) -> Result<Vec<SearchResult>, String> {
+async fn search_files(
+    scope: tauri::State<'_, SharedVaultScope>,
+    path: String,
+    query: String,
+) -> Result<Vec<SearchResult>, String> {
     const MAX_RESULTS: usize = 50;
     const MAX_MATCHES_PER_FILE: usize = 5;
 
@@ -687,7 +1329,7 @@ async fn search_files(app: AppHandle, path: String, query: String) -> Result<Vec
     // linked folder out of scope of search. Take the vault in its settings
     // spelling, not canonicalized: the frontend sends paths in that spelling, and
     // a canonical vault root cannot match them when the vault itself is a symlink.
-    let vault_str = get_configured_vault_setting(&app).ok_or("No vault is configured")?;
+    let vault_str = configured_notebook(&scope)?;
     let root = validate_vault_path(&path, &vault_str)
         .map_err(|_| "Access denied: search path is outside the vault directory".to_string())?;
 
@@ -771,8 +1413,10 @@ async fn search_files(app: AppHandle, path: String, query: String) -> Result<Vec
 }
 
 #[tauri::command]
-async fn list_assets(path: String) -> Result<Vec<AssetEntry>, String> {
+async fn list_assets(scope: tauri::State<'_, SharedVaultScope>, path: String) -> Result<Vec<AssetEntry>, String> {
     let mut assets: Vec<AssetEntry> = Vec::new();
+    let vault_path = validate_vault_path(&path, &configured_notebook(&scope)?)?;
+    let path = vault_path.to_string_lossy().to_string();
     let vault_path = Path::new(&path);
 
     if !vault_path.exists() {
@@ -2078,8 +2722,11 @@ type SharedWatcherState = Arc<Mutex<WatcherState>>;
 fn start_watching(
     app: AppHandle,
     state: tauri::State<'_, SharedWatcherState>,
+    scope: tauri::State<'_, SharedVaultScope>,
     path: String,
 ) -> Result<(), String> {
+    // A watcher reports every change below its path; keep it inside the notebook.
+    let path = validate_vault_path(&path, &configured_notebook(&scope)?)?;
     let mut watcher_state = state.lock();
 
     // Stop existing watcher if any
@@ -2089,41 +2736,25 @@ fn start_watching(
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                // Emit for create, modify, remove events on .md files, viewable files, or directories
-                let dominated_by_md = event
-                    .paths
-                    .iter()
-                    .any(|p| p.extension().map(|e| e == "md").unwrap_or(false));
-
-                let dominated_by_viewable = event
-                    .paths
-                    .iter()
-                    .any(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| is_viewable_extension(n))
-                            .unwrap_or(false)
-                    });
-
-                let dominated_by_dir = event.paths.iter().any(|p| p.is_dir());
-
-                if dominated_by_md || dominated_by_viewable || dominated_by_dir {
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                            let _ = app_clone.emit("files-changed", ());
-                            // Also emit specific file paths for open tab reload
-                            let paths: Vec<String> = event
-                                .paths
-                                .iter()
-                                .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
-                                .filter_map(|p| p.to_str().map(|s| s.to_string()))
-                                .collect();
-                            if !paths.is_empty() {
-                                let _ = app_clone.emit("file-modified", paths);
-                            }
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                        // Shared vaults include binary files, dotfiles and removed
+                        // directories. Keep all affected paths, not sidebar types.
+                        let paths: Vec<String> = event
+                            .paths
+                            .iter()
+                            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                            .collect();
+                        let _ = app_clone.emit("files-changed", &paths);
+                        let markdown: Vec<String> = paths
+                            .into_iter()
+                            .filter(|p| std::path::Path::new(p).extension().map(|e| e == "md").unwrap_or(false))
+                            .collect();
+                        if !markdown.is_empty() {
+                            let _ = app_clone.emit("file-modified", markdown);
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         },
@@ -2135,7 +2766,7 @@ fn start_watching(
 
     // Start watching the path
     if let Some(ref mut w) = watcher_state.watcher {
-        w.watch(Path::new(&path), RecursiveMode::Recursive)
+        w.watch(&path, RecursiveMode::Recursive)
             .map_err(|e| e.to_string())?;
     }
 
@@ -3008,6 +3639,7 @@ pub fn run() {
     builder
         .manage(Arc::new(Mutex::new(PtyState::default())) as SharedPtyState)
         .manage(Arc::new(Mutex::new(WatcherState::default())) as SharedWatcherState)
+        .manage(Arc::new(Mutex::new(VaultScopeState::default())) as SharedVaultScope)
         .manage(opencode_server_state)
         // Clean up OpenCode server and PTY children on app exit
         .on_window_event(move |window, event| {
@@ -3052,7 +3684,11 @@ pub fn run() {
             // `lexically_normalize` inside `validate_vault_path` resolves `..`
             // properly and rejects the escapes.
             let resolved = {
-                let in_vault = get_configured_vault_setting(app)
+                let in_vault = app
+                    .state::<SharedVaultScope>()
+                    .lock()
+                    .notebook
+                    .clone()
                     .and_then(|vault| validate_vault_path(&decoded_path, &vault).ok());
                 // Also allow config directory access (for app assets).
                 in_vault.or_else(|| {
@@ -3130,6 +3766,10 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // The notebook the vault commands validate against, before the
+            // frontend has had a chance to say anything.
+            app.state::<SharedVaultScope>().lock().notebook =
+                get_configured_vault_setting(&app.handle());
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -3141,6 +3781,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_files,
+            list_files_all,
             list_assets,
             read_file,
             write_file,
@@ -3148,6 +3789,10 @@ pub fn run() {
             read_binary_file,
             create_file,
             create_folder,
+            managed_write_binary,
+            managed_read_binary,
+            managed_mkdir,
+            managed_delete,
             set_vault_scope,
             get_file_modified_time,
             file_exists,
@@ -3157,6 +3802,7 @@ pub fn run() {
             open_in_default_app,
             show_in_folder,
             search_files,
+            resolve_real_path,
             get_file_stats,
             start_opencode_server,
             stop_opencode_server,
@@ -3168,6 +3814,7 @@ pub fn run() {
             pty::resize_pty,
             pty::kill_pty,
             load_settings,
+            resolve_recovery_destination,
             save_settings,
             keyring_commands::keyring_set,
             keyring_commands::keyring_get,
@@ -3221,6 +3868,139 @@ mod vault_path_tests {
 
     fn vault_of(root: &Path) -> String {
         root.join("vault").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn recovery_destination_rejects_notebook_paths_and_symlink_aliases() {
+        let root = fixture("recovery-destination");
+        let vault = vault_of(&root);
+        symlink(root.join("vault"), root.join("alias")).unwrap();
+        symlink(root.join("vault/Notes/plain.md"), root.join("linked.json")).unwrap();
+        for relative in ["vault/recovery.json", "alias/recovery.json", "linked.json", "vault/Projects/recovery.json"] {
+            assert!(resolve_recovery_destination(root.join(relative).to_string_lossy().into_owned(), vault.clone()).is_err());
+        }
+        let destination = root.join("recovery.json");
+        assert_eq!(resolve_recovery_destination(destination.to_string_lossy().into_owned(), vault.clone()).unwrap(),
+            destination.parent().unwrap().canonicalize().unwrap().join("recovery.json").to_string_lossy());
+        assert!(resolve_recovery_destination("recovery.json".into(), vault).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_all_includes_hidden_and_binary_entries_without_following_links() {
+        let root = fixture("list-all");
+        let vault = vault_of(&root);
+        let directory = root.join("vault");
+        fs::create_dir_all(directory.join(".config/empty")).unwrap();
+        fs::write(directory.join(".config/settings.json"), "{}").unwrap();
+        fs::write(directory.join(".env"), "KEY=value").unwrap();
+        fs::write(directory.join("archive.bin"), [0, 255]).unwrap();
+        fs::write(directory.join("note.md"), "# note").unwrap();
+        symlink("..", directory.join("Notes/loop")).unwrap();
+        symlink(directory.join("archive.bin"), directory.join("linked.bin")).unwrap();
+
+        let tree = list_files_all_in(&vault, &vault).unwrap();
+        let names: Vec<_> = tree.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, [".config", "Notes", ".env", "archive.bin", "note.md"]);
+        let config = tree[0].children.as_ref().unwrap();
+        assert_eq!(config[0].name, "empty");
+        assert!(config[0].children.as_ref().unwrap().is_empty());
+        assert_eq!(config[1].name, "settings.json");
+        let notes = tree[1].children.as_ref().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].name, "plain.md");
+
+        let sidebar = list_files_in(&vault, &vault).unwrap();
+        let sidebar_names: Vec<_> = sidebar.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(sidebar_names, ["Notes", "Projects", "note.md"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_all_matches_shared_web_conformance_fixture() {
+        let root = fixture("list-all-conformance");
+        let vault = vault_of(&root);
+        let directory = root.join("vault/conformance");
+        fs::create_dir_all(&directory).unwrap();
+        let expected: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/list-all-conformance.json"
+        )).unwrap();
+        for entry in &expected {
+            let path = directory.join(entry["path"].as_str().unwrap());
+            if entry["isDirectory"].as_bool().unwrap() {
+                fs::create_dir_all(path).unwrap();
+            } else {
+                fs::write(path, [0, 255]).unwrap();
+            }
+        }
+        symlink("..", directory.join("nested/loop")).unwrap();
+        symlink(directory.join("archive.bin"), directory.join("linked.bin")).unwrap();
+        let entries = list_files_all_in(&vault, &directory.to_string_lossy()).unwrap();
+        fn flatten(entries: &[FileEntry], root: &Path, result: &mut Vec<serde_json::Value>) {
+            for entry in entries {
+                result.push(serde_json::json!({
+                    "path": Path::new(&entry.path).strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"),
+                    "isDirectory": entry.is_directory
+                }));
+                if let Some(children) = &entry.children { flatten(children, root, result); }
+            }
+        }
+        let mut actual = Vec::new();
+        flatten(&entries, &directory, &mut actual);
+        actual.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_all_requires_a_directory_inside_the_notebook() {
+        let root = fixture("list-all-scope");
+        let vault = vault_of(&root);
+        assert!(list_files_all_in(&vault, &root.to_string_lossy()).is_err());
+        assert!(list_files_all_in(&vault, &format!("{}/../real", vault)).is_err());
+        assert!(list_files_all_in(&vault, "Notes").is_err());
+        assert!(list_files_all_in(&vault, &format!("{}/missing", vault)).is_err());
+        assert!(list_files_all_in(&vault, &format!("{}/Notes/plain.md", vault)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// SV-40 (H4): the frontend used to send `{ path: root, vaultPath: root }`, so
+    /// any readable directory passed as both arguments was its own scope. The
+    /// scope now comes from the configured notebook only; a caller-supplied root
+    /// that is a real, readable directory outside it is refused by every command.
+    #[test]
+    fn a_caller_supplied_root_outside_the_notebook_is_refused() {
+        let root = fixture("caller-root");
+        let notebook = vault_of(&root);
+        let outside = root.join("real");
+        fs::write(outside.join("onyx/secret.md"), "secret").unwrap();
+        let outside_str = outside.to_string_lossy().to_string();
+        let secret = outside.join("onyx/secret.md").to_string_lossy().to_string();
+        let scratch = outside.join("scratch").to_string_lossy().to_string();
+
+        assert!(outside.is_dir(), "the refused root is a genuine directory");
+        assert!(list_files_all_in(&notebook, &outside_str).is_err());
+        assert!(list_files_in(&notebook, &outside_str).is_err());
+        assert!(read_file_in(&notebook, &secret).is_err());
+        assert!(read_binary_file_in(&notebook, &secret).is_err());
+        assert!(write_file_in(&notebook, &scratch, "x").is_err());
+        assert!(write_binary_file_in(&notebook, &scratch, b"x").is_err());
+        assert!(create_file_in(&notebook, &scratch).is_err());
+        assert!(create_folder_in(&notebook, &scratch).is_err());
+        assert!(delete_file_in(&notebook, &secret).is_err());
+        assert!(rename_file_in(&notebook, &secret, &scratch).is_err());
+        assert!(copy_file_in(&notebook, &secret, &scratch).is_err());
+        // Both directions: a notebook path may not be moved or copied outside either.
+        let inside = root.join("vault/Notes/plain.md").to_string_lossy().to_string();
+        assert!(rename_file_in(&notebook, &inside, &scratch).is_err());
+        assert!(copy_file_in(&notebook, &inside, &scratch).is_err());
+
+        assert_eq!(fs::read_to_string(outside.join("onyx/secret.md")).unwrap(), "secret");
+        assert!(!outside.join("scratch").exists());
+        // The same calls succeed for the configured notebook itself.
+        assert!(list_files_all_in(&notebook, &notebook).is_ok());
+        assert!(read_file_in(&notebook, &inside).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3399,6 +4179,54 @@ mod vault_path_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// SV-42 (H6): the report's fixture. `notebook/Alias -> notebook/Shared`
+    /// is not a managed path by spelling, but its identity is the mount. The
+    /// sidebar marks the alias as a link so the frontend asks for identity only
+    /// where it matters, and `resolve_real_path` answers for existing and
+    /// not-yet-created paths alike; capture never lists the alias at all.
+    #[test]
+    fn an_alias_into_a_mount_is_flagged_and_resolves_to_the_mount() {
+        let root = fixture("alias-identity");
+        let notebook_dir = root.join("vault");
+        let notebook = notebook_dir.to_string_lossy().to_string();
+        let s = |path: &Path| path.to_string_lossy().to_string();
+        fs::create_dir_all(notebook_dir.join("Shared")).unwrap();
+        fs::write(notebook_dir.join("Shared/private.md"), "secret").unwrap();
+        symlink(notebook_dir.join("Shared"), notebook_dir.join("Alias")).unwrap();
+        let shared = notebook_dir.join("Shared").canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_real_path_in(&notebook, &s(&notebook_dir.join("Alias/private.md"))).unwrap(),
+            s(&shared.join("private.md"))
+        );
+        assert_eq!(
+            resolve_real_path_in(&notebook, &s(&notebook_dir.join("Alias/new/deeper.md"))).unwrap(),
+            s(&shared.join("new/deeper.md")),
+            "a path that does not exist yet resolves through its nearest existing ancestor"
+        );
+        assert_eq!(resolve_real_path_in(&notebook, &s(&notebook_dir.join("Shared"))).unwrap(), s(&shared));
+        assert_eq!(
+            resolve_real_path_in(&notebook, &s(&notebook_dir.join("Notes/plain.md"))).unwrap(),
+            s(&notebook_dir.join("Notes/plain.md").canonicalize().unwrap())
+        );
+        assert!(resolve_real_path_in(&notebook, &s(&root.join("real/onyx/README.md"))).is_err());
+
+        let sidebar = list_files_in(&notebook, &notebook).unwrap();
+        let alias = sidebar.iter().find(|e| e.name == "Alias").expect("the sidebar follows the alias");
+        assert_eq!(alias.is_symlink, Some(true));
+        assert!(alias.is_directory);
+        assert_eq!(alias.children.as_ref().unwrap()[0].name, "private.md");
+        let shared_entry = sidebar.iter().find(|e| e.name == "Shared").unwrap();
+        assert_eq!(shared_entry.is_symlink, None);
+        assert_eq!(shared_entry.children.as_ref().unwrap()[0].is_symlink, None);
+        assert_eq!(serde_json::to_value(shared_entry).unwrap().get("isSymlink"), None);
+        assert_eq!(serde_json::to_value(alias).unwrap()["isSymlink"], serde_json::json!(true));
+
+        let capture = list_files_all_in(&notebook, &notebook).unwrap();
+        assert!(capture.iter().all(|e| e.name != "Alias"), "capture omits links entirely");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Momus's case 17 verbatim: `links/dir-abs-outside/../../outside/notes/second.md`,
     /// where `dir-abs-outside` links out of the vault. Two `..` pop the link and
     /// `links`, landing on `<vault>/outside/notes/second.md`, which is *inside* —
@@ -3445,12 +4273,8 @@ mod vault_path_tests {
         let link = root.join("vault/Notes/linked-note.md");
         symlink(&outside, &link).unwrap();
 
-        write_file(
-            link.to_string_lossy().to_string(),
-            "# edited through the link".to_string(),
-            Some(vault),
-        )
-        .expect("saving a symlinked note must succeed");
+        write_file_in(&vault, &link.to_string_lossy(), "# edited through the link")
+            .expect("saving a symlinked note must succeed");
 
         assert_eq!(
             fs::read_to_string(&outside).unwrap(),
@@ -3464,6 +4288,43 @@ mod vault_path_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// SV-39 (H3b): `fs::write` truncated the live file before writing, so a
+    /// crash mid-write left partial live bytes. The managed install fills a
+    /// temporary and renames it over the target; a failure after partial bytes
+    /// leaves the live file exactly as it was and no temporary behind.
+    #[test]
+    fn a_partial_install_never_becomes_the_live_file() {
+        let root = fixture("managed-crash");
+        let dir_path = root.join("vault/Notes");
+        let live = dir_path.join("live.md");
+        fs::write(&live, "old").unwrap();
+        let orphans = || -> Vec<String> {
+            fs::read_dir(&dir_path).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with(MANAGED_TEMP_PREFIX)).collect()
+        };
+
+        let dir = confined::open_root(&dir_path.canonicalize().unwrap()).unwrap();
+        let err = confined::write_atomic(&dir, std::ffi::OsStr::new("live.md"), |file| {
+            std::io::Write::write_all(file, b"par")?;
+            Err(std::io::Error::other("injected crash"))
+        })
+        .unwrap_err();
+        assert!(err.contains("injected crash"), "{err}");
+        assert_eq!(fs::read_to_string(&live).unwrap(), "old", "partial bytes must never be visible at the live path");
+        assert!(orphans().is_empty(), "the temporary is removed on failure");
+
+        // A new file that fails mid-write never appears at all.
+        assert!(confined::write_atomic(&dir, std::ffi::OsStr::new("fresh.md"), |_| Err(std::io::Error::other("boom"))).is_err());
+        assert!(!dir_path.join("fresh.md").exists());
+        assert!(orphans().is_empty());
+
+        // And a complete install is visible in full, once.
+        confined::write_atomic(&dir, std::ffi::OsStr::new("live.md"), |file| std::io::Write::write_all(file, b"new")).unwrap();
+        assert_eq!(fs::read_to_string(&live).unwrap(), "new");
+        assert!(orphans().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Momus's C4, which he predicted would destroy data and then measured as safe:
     /// `remove_dir_all` refuses to descend a symlink, so deleting a linked folder
     /// removes only the link. Fenced here because `delete_file` reaches that branch
@@ -3474,7 +4335,7 @@ mod vault_path_tests {
         let vault = vault_of(&root);
         let link = root.join("vault/Projects");
 
-        delete_file(link.to_string_lossy().to_string(), Some(vault)).expect("delete must succeed");
+        delete_file_in(&vault, &link.to_string_lossy()).expect("delete must succeed");
 
         assert!(!fs::symlink_metadata(&link).is_ok(), "the link is gone");
         assert!(
@@ -3535,6 +4396,161 @@ mod vault_path_tests {
     /// no root to match, so it denies. `search_files` used to source its vault from
     /// a canonicalizing helper, which denied every search for anyone whose vault is
     /// a symlink. This test pins the asymmetry so the helper cannot be swapped back.
+    // -----------------------------------------------------------------------
+    // Managed (shared-vault) primitives: SV-32 confinement.
+    // -----------------------------------------------------------------------
+
+    /// A shared mount at `<tmp>/vault/mount` with every shape of planted link:
+    ///   vault/mount/link      -> <tmp>/real          (directory link mid-path)
+    ///   vault/mount/note.md   -> <tmp>/real/onyx/README.md (file link at the target)
+    ///   vault/Shared          -> <tmp>/real          (link *at* a mount root)
+    fn managed_fixture(tag: &str) -> PathBuf {
+        let root = fixture(tag);
+        fs::create_dir_all(root.join("vault/mount")).unwrap();
+        symlink(root.join("real"), root.join("vault/mount/link")).unwrap();
+        symlink(root.join("real/onyx/README.md"), root.join("vault/mount/note.md")).unwrap();
+        symlink(root.join("real"), root.join("vault/Shared")).unwrap();
+        root
+    }
+
+    fn s(path: &Path) -> String {
+        path.to_string_lossy().to_string()
+    }
+
+    fn temp_orphans(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(MANAGED_TEMP_PREFIX))
+            .collect()
+    }
+
+    /// SV-32 (H3): the attack from the report. `validate_vault_path` accepts
+    /// `mount/link/new.md` lexically and the legacy `write_binary_file` would
+    /// have created `<tmp>/real/new.md`. The managed write refuses every link
+    /// below the root — mid-path, at the final component, and at a mount root —
+    /// and nothing outside the notebook changes.
+    #[test]
+    fn managed_write_never_follows_a_descendant_link() {
+        let root = managed_fixture("managed-no-follow");
+        let notebook = vault_of(&root);
+        let readme = root.join("real/onyx/README.md");
+
+        for relative in ["vault/mount/link/new.md", "vault/mount/link/deeper/new.md", "vault/Shared/new.md"] {
+            let err = managed_write_bytes(&notebook, &s(&root.join(relative)), b"remote").unwrap_err();
+            assert!(err.contains("symbolic link"), "{relative}: {err}");
+        }
+        assert!(!root.join("real/new.md").exists(), "the write must not land through the link");
+        assert!(!root.join("real/deeper").exists(), "no directory may be created through the link either");
+
+        let err = managed_write_bytes(&notebook, &s(&root.join("vault/mount/note.md")), b"remote").unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(fs::read_to_string(&readme).unwrap(), "# linked", "the link target is untouched");
+        assert!(fs::symlink_metadata(root.join("vault/mount/note.md")).unwrap().file_type().is_symlink(), "and the link itself is preserved");
+
+        // The legacy command keeps following links (Derek's ruling), so the two
+        // surfaces must differ on exactly this input.
+        write_binary_file_in(&notebook, &s(&root.join("vault/mount/link/legacy.md")), b"user").unwrap();
+        assert!(root.join("real/legacy.md").exists());
+        assert!(temp_orphans(&root.join("vault/mount")).is_empty());
+
+        // And like every vault command, the managed ones refuse a caller-supplied
+        // path outside the configured notebook outright.
+        let outside = root.join("real/onyx");
+        assert!(managed_write_bytes(&notebook, &s(&outside.join("scratch")), b"x").is_err());
+        assert!(managed_read_bytes(&notebook, &s(&readme)).is_err());
+        assert!(managed_create_folder(&notebook, &s(&outside.join("scratch"))).is_err());
+        assert!(managed_remove(&notebook, &s(&readme)).is_err());
+        assert!(readme.exists() && !outside.join("scratch").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The notebook root itself may be the user's symlink; only descendants may not
+    /// redirect. Both spellings of a path under a linked root install into the
+    /// real directory.
+    #[test]
+    fn managed_write_accepts_a_symlinked_notebook_root() {
+        let root = fixture("managed-linked-root");
+        let link_vault = root.join("vault-link");
+        symlink(root.join("vault"), &link_vault).unwrap();
+        let notebook = s(&link_vault);
+
+        managed_write_bytes(&notebook, &s(&link_vault.join("Notes/from-link.md")), b"a").unwrap();
+        managed_write_bytes(&notebook, &s(&root.join("vault/Notes/from-canonical.md")), b"b").unwrap();
+        assert_eq!(fs::read(root.join("vault/Notes/from-link.md")).unwrap(), b"a");
+        assert_eq!(fs::read(root.join("vault/Notes/from-canonical.md")).unwrap(), b"b");
+        assert_eq!(managed_read_bytes(&notebook, &s(&link_vault.join("Notes/from-canonical.md"))).unwrap(), b"b");
+        // A link *below* the linked root is still refused.
+        assert!(managed_write_bytes(&notebook, &s(&link_vault.join("Projects/new.md")), b"c").is_err());
+        assert!(!root.join("real/onyx/new.md").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn managed_write_creates_parents_and_replaces_without_orphans() {
+        let root = managed_fixture("managed-replace");
+        let notebook = vault_of(&root);
+        let target = root.join("vault/mount/a/b/c.md");
+
+        managed_write_bytes(&notebook, &s(&target), b"one").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+        managed_write_bytes(&notebook, &s(&target), b"two").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"two");
+        assert!(temp_orphans(target.parent().unwrap()).is_empty());
+        // A replaced regular file keeps its permission bits (a 0600 note stays 0600).
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        managed_write_bytes(&notebook, &s(&target), b"three").unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&target).unwrap(), b"three");
+        // Replacing a directory with a file is a type transition the engine
+        // performs through `remove` first; the install alone refuses it.
+        assert!(managed_write_bytes(&notebook, &s(&root.join("vault/mount/a")), b"x").is_err());
+        assert!(root.join("vault/mount/a/b/c.md").exists());
+        assert!(temp_orphans(&root.join("vault/mount")).is_empty());
+        // The root itself is never a write target.
+        assert!(managed_write_bytes(&notebook, &notebook, b"x").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn managed_remove_read_and_mkdir_never_follow_links() {
+        let root = managed_fixture("managed-remove");
+        let notebook = vault_of(&root);
+        let mount = root.join("vault/mount");
+        fs::create_dir_all(mount.join("dir/sub")).unwrap();
+        fs::write(mount.join("dir/sub/file.md"), "x").unwrap();
+        symlink(root.join("real"), mount.join("dir/escape")).unwrap();
+        symlink(root.join("real/onyx/README.md"), mount.join("dir/escape.md")).unwrap();
+
+        // Through a link component: refused, target untouched.
+        assert!(managed_remove(&notebook, &s(&mount.join("link/onyx"))).is_err());
+        assert!(managed_remove(&notebook, &s(&mount.join("link/onyx/README.md"))).is_err());
+        assert!(managed_read_bytes(&notebook, &s(&mount.join("link/onyx/README.md"))).is_err());
+        assert!(managed_read_bytes(&notebook, &s(&mount.join("note.md"))).is_err());
+        assert!(managed_create_folder(&notebook, &s(&mount.join("link/made"))).is_err());
+        assert!(managed_create_folder(&notebook, &s(&root.join("vault/Shared/made"))).is_err());
+        assert!(!root.join("real/made").exists());
+        assert!(root.join("real/onyx/README.md").exists());
+
+        // A tree containing links: the links are unlinked, their targets survive.
+        managed_remove(&notebook, &s(&mount.join("dir"))).unwrap();
+        assert!(!mount.join("dir").exists());
+        assert_eq!(fs::read_to_string(root.join("real/onyx/README.md")).unwrap(), "# linked");
+        assert!(root.join("real/onyx").is_dir());
+
+        // Removing a link itself removes only the link.
+        managed_remove(&notebook, &s(&mount.join("link"))).unwrap();
+        assert!(fs::symlink_metadata(mount.join("link")).is_err());
+        assert!(root.join("real/onyx/README.md").exists());
+        assert!(managed_remove(&notebook, &s(&mount.join("missing"))).is_err());
+
+        managed_create_folder(&notebook, &s(&mount.join("new/nested"))).unwrap();
+        assert!(mount.join("new/nested").is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_canonical_vault_root_cannot_match_a_link_spelled_path() {
         let root = fixture("linked-vault-asymmetry");

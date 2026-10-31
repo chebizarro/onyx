@@ -45,6 +45,10 @@ tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5.0"
 sha2 = "0.10"
+[target.'cfg(unix)'.dependencies]
+# Directory-fd-relative `openat`/`mkdirat`/`renameat`/`unlinkat` for the managed
+# vault write confinement (SV-32/SV-39). Already in the lock file transitively.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 portable-pty = "0.8"
