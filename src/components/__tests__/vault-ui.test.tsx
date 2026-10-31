@@ -21,8 +21,28 @@ const platformMock = vi.hoisted(() => ({
 vi.mock('@platform', () => ({ platform: platformMock }));
 
 import Sidebar from '../Sidebar';
+import ShareDialog, { SHARE_VALIDATION_DEBOUNCE_MS } from '../ShareDialog';
+
+const fetchUserProfile = vi.hoisted(() => vi.fn(async (_pubkey: string, _relays: string[]) => null as null | { name?: string; picture?: string }));
+vi.mock('../../lib/nostr/login', () => ({ fetchUserProfile }));
+vi.mock('../../lib/nostr/sync', () => ({
+  getSyncEngine: () => ({ getConfig: () => ({ relays: ['wss://profile.example'] }) }),
+}));
+
+const BOB = 'b'.repeat(64);
+const CAROL = 'c'.repeat(64);
+const resolveRecipient = vi.fn(async (input: string) => {
+  const map: Record<string, string> = { bob: BOB, carol: CAROL, me: 'a'.repeat(64) };
+  const pubkey = map[input] ?? null;
+  return pubkey
+    ? { pubkey, type: 'hex' as const }
+    : { pubkey: null, type: 'invalid' as const, error: 'Invalid format' };
+});
+
 
 beforeEach(() => {
+  fetchUserProfile.mockClear();
+  resolveRecipient.mockClear();
   Object.values(platformMock.vault).forEach((fn) => fn.mockClear());
 });
 afterEach(() => cleanup());
@@ -164,5 +184,75 @@ describe('Sidebar gestures and input focus', () => {
       fireEvent.keyDown(window, { key: 'Escape' });
       expect(document.querySelector('.context-menu')).toBeNull();
     });
+  });
+});
+
+describe('ShareDialog recipient binding', () => {
+  const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  type Resolver = (input: string) => Promise<{ pubkey: string | null; type: 'hex' | 'invalid'; error?: string }>;
+  type ShareFn = (pubkey: string, title: string, content: string, filePath: string) => Promise<{ eventId: string }>;
+  const shareMock = () => vi.fn<ShareFn>(async () => ({ eventId: 'evt' }));
+  const renderDialog = (shareDocument: ReturnType<typeof shareMock>, resolve: Resolver = resolveRecipient) => render(() => (
+    <ShareDialog filePath="notes/a.md" content="hello" title="a" onClose={() => undefined}
+      resolveRecipient={resolve as never} shareDocument={shareDocument as never} />
+  ));
+  const field = () => screen.getByLabelText('Share with') as HTMLInputElement;
+  const shareButton = () => screen.getByRole('button', { name: 'Share' }) as HTMLButtonElement;
+
+  it('cancels the pending debounce when the field is cleared; nothing is shared to the earlier key', async () => {
+    const shareDocument = shareMock();
+    renderDialog(shareDocument);
+    // Report fixture: type key A, clear, let the 500 ms timer elapse, press Share/Enter.
+    fireEvent.input(field(), { target: { value: 'bob' } });
+    fireEvent.input(field(), { target: { value: '' } });
+    await vi.advanceTimersByTimeAsync(SHARE_VALIDATION_DEBOUNCE_MS + 100);
+    await flush();
+    expect(resolveRecipient).not.toHaveBeenCalled();
+    expect(field().value).toBe('');
+    expect(shareButton().disabled).toBe(true);
+    fireEvent.click(shareButton());
+    fireEvent.keyDown(field(), { key: 'Enter' });
+    await flush();
+    expect(shareDocument).not.toHaveBeenCalled();
+  });
+
+  it('discards a resolution that settles after the field changed and shares only the current pair', async () => {
+    let resolveBob!: (value: { pubkey: string; type: 'hex' }) => void;
+    const slow: Resolver = vi.fn((input: string) => input === 'bob'
+      ? new Promise<{ pubkey: string; type: 'hex' }>((r) => { resolveBob = r; })
+      : resolveRecipient(input));
+    const shareDocument = shareMock();
+    renderDialog(shareDocument, slow);
+
+    fireEvent.input(field(), { target: { value: 'bob' } });
+    await vi.advanceTimersByTimeAsync(SHARE_VALIDATION_DEBOUNCE_MS + 10); // bob resolution now in flight
+    fireEvent.input(field(), { target: { value: 'carol' } });
+    await vi.advanceTimersByTimeAsync(SHARE_VALIDATION_DEBOUNCE_MS + 10);
+    await flush();
+    resolveBob({ pubkey: BOB, type: 'hex' }); // stale generation settles last
+    await flush();
+
+    expect(shareButton().disabled).toBe(false);
+    fireEvent.click(shareButton());
+    await flush();
+    expect(shareDocument).toHaveBeenCalledTimes(1);
+    expect(shareDocument.mock.calls[0][0]).toBe(CAROL);
+  });
+
+  it('disables sharing again as soon as a validated recipient is edited', async () => {
+    const shareDocument = shareMock();
+    renderDialog(shareDocument);
+    fireEvent.input(field(), { target: { value: 'bob' } });
+    await vi.advanceTimersByTimeAsync(SHARE_VALIDATION_DEBOUNCE_MS + 10);
+    await flush();
+    expect(shareButton().disabled).toBe(false);
+    fireEvent.input(field(), { target: { value: 'bo' } });
+    expect(shareButton().disabled).toBe(true);
+    fireEvent.keyDown(field(), { key: 'Enter' });
+    await flush();
+    expect(shareDocument).not.toHaveBeenCalled();
   });
 });
