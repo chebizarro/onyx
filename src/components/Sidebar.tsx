@@ -5,6 +5,14 @@ import { isMobile } from '../lib/platform';
 import { searchFileContents } from '../lib/editor/note-index';
 
 /**
+ * WebKit honours the `autofocus` attribute only once per document, so the inline
+ * rename/new-item inputs focus themselves once Solid has attached them.
+ */
+const focusOnMount = (el: HTMLInputElement) => {
+  queueMicrotask(() => { if (el.isConnected) el.focus(); });
+};
+
+/**
  * Get the parent directory of a path, handling both / and \ separators (Windows compatibility).
  */
 function getParentPath(filePath: string): string {
@@ -223,19 +231,79 @@ const Sidebar: Component<SidebarProps> = (props) => {
     x = Math.max(margin, Math.min(x, window.innerWidth - menuWidth - margin));
 
     setContextMenu({ x, y, path, isDir, openUpward });
+    // WebKit dispatches `contextmenu` during mousedown, so the press that opened the
+    // menu is still held: remember it so its mouseup/click are not misread.
+    if (pressActive) {
+      menuPress = { x: e.clientX, y: e.clientY };
+      swallowGestureClickUntil = Number.POSITIVE_INFINITY;
+    }
   };
 
   const closeContextMenu = () => {
     setContextMenu(null);
   };
 
+  // Context-menu gestures. WebKit (macOS) fires `contextmenu` on mousedown, so a
+  // Control+click opens the menu and then delivers mouseup + `click` to the row,
+  // which used to dismiss the menu (and toggle/open the row) at once; a
+  // press-hold-release ends on an item without any `click` on it.
+  let menuEl: HTMLDivElement | undefined;
+  let pressActive = false;
+  let menuPress: { x: number; y: number } | null = null;
+  let swallowGestureClickUntil = 0;
+  const GESTURE_CLICK_MS = 400;
+  const DRAG_RELEASE_PX = 4;
+  const inMenu = (target: EventTarget | null) => !!menuEl && target instanceof Node && menuEl.contains(target);
+
+  const handlePressStart = (e: Event) => {
+    pressActive = true;
+    menuPress = null;
+    swallowGestureClickUntil = 0;
+    // Dismiss on a press outside the menu instead of waiting for a `click`.
+    if (contextMenu() && !inMenu(e.target)) closeContextMenu();
+  };
+
+  const handlePressEnd = (e: MouseEvent) => {
+    pressActive = false;
+    const press = menuPress;
+    menuPress = null;
+    if (!press) return;
+    // Only a primary-button release is followed by a `click`.
+    swallowGestureClickUntil = e.button === 0 ? performance.now() + GESTURE_CLICK_MS : 0;
+    const item = e.target instanceof Element ? e.target.closest('.context-menu-item') : null;
+    if (item instanceof HTMLElement && inMenu(item)
+      && Math.hypot(e.clientX - press.x, e.clientY - press.y) > DRAG_RELEASE_PX) {
+      item.click();
+    }
+  };
+
+  const handleGestureClick = (e: MouseEvent) => {
+    if (performance.now() >= swallowGestureClickUntil || inMenu(e.target)) return;
+    swallowGestureClickUntil = 0;
+    e.stopPropagation();
+    e.preventDefault();
+  };
+
+  const handleMenuKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape' && contextMenu()) closeContextMenu();
+  };
+
+  /** The new-item input renders inside its folder's children, so the folder must be expanded. */
+  const revealFolder = (path: string) => {
+    if (path === props.vaultPath || expandedFolders().has(path)) return;
+    setExpandedFolders(new Set([...expandedFolders(), path]));
+    setAllCollapsed(false);
+  };
+
   const handleCreateFile = async (parentPath: string) => {
+    revealFolder(parentPath);
     setIsCreating({ parentPath, type: 'file' });
     setNewItemName('');
     closeContextMenu();
   };
 
   const handleCreateFolder = async (parentPath: string) => {
+    revealFolder(parentPath);
     setIsCreating({ parentPath, type: 'folder' });
     setNewItemName('');
     closeContextMenu();
@@ -629,7 +697,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
                   if (e.key === 'Escape') setIsRenaming(null);
                 }}
                 onBlur={() => confirmRename(itemProps.entry.path)}
-                autofocus
+                ref={focusOnMount}
                 onClick={(e) => e.stopPropagation()}
               />
             }
@@ -658,7 +726,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
                   if (newItemName()) confirmCreate();
                   else setIsCreating(null);
                 }}
-                autofocus
+                ref={focusOnMount}
               />
             </div>
           </Show>
@@ -682,10 +750,20 @@ const Sidebar: Component<SidebarProps> = (props) => {
 
   onMount(() => {
     document.addEventListener('click', handleGlobalClick);
+    window.addEventListener('pointerdown', handlePressStart, true);
+    window.addEventListener('mousedown', handlePressStart, true);
+    window.addEventListener('mouseup', handlePressEnd, true);
+    window.addEventListener('click', handleGestureClick, true);
+    window.addEventListener('keydown', handleMenuKeyDown);
   });
 
   onCleanup(() => {
     document.removeEventListener('click', handleGlobalClick);
+    window.removeEventListener('pointerdown', handlePressStart, true);
+    window.removeEventListener('mousedown', handlePressStart, true);
+    window.removeEventListener('mouseup', handlePressEnd, true);
+    window.removeEventListener('click', handleGestureClick, true);
+    window.removeEventListener('keydown', handleMenuKeyDown);
     if (searchTimeout) clearTimeout(searchTimeout);
   });
 
@@ -873,7 +951,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
                     if (newItemName()) confirmCreate();
                     else setIsCreating(null);
                   }}
-                  autofocus
+                  ref={focusOnMount}
                 />
               </div>
             </Show>
@@ -1036,6 +1114,7 @@ const Sidebar: Component<SidebarProps> = (props) => {
       {/* Context Menu */}
       <Show when={contextMenu()}>
         <div
+          ref={menuEl}
           class={`context-menu ${contextMenu()!.openUpward ? 'open-upward' : ''}`}
           style={{ 
             left: `${contextMenu()!.x}px`, 
